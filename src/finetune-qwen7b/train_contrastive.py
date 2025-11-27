@@ -35,6 +35,9 @@ from pathlib import Path
 import wandb
 import pandas as pd
 
+from loss_func import HardNegativeInfoNCELossWithLabels
+from playdata import BinarySourceDataset
+
 # 设置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -60,7 +63,7 @@ class TrainingConfig:
     
     # 训练配置
     batch_size: int = 16
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 4
     learning_rate: float = 2e-5
     num_epochs: int = 10
     warmup_ratio: float = 0.1
@@ -74,7 +77,7 @@ class TrainingConfig:
     hard_negative_weight: float = 1.0  # 困难负样本权重
     
     # 数据配置
-    max_seq_length: int = 1024
+    max_seq_length: int = 512
     train_data_path: str = "data/train.json"
     val_data_path: str = "data/val.json"
     
@@ -86,83 +89,6 @@ class TrainingConfig:
     seed: int = 42
     fp16: bool = True
     use_wandb: bool = False
-
-
-class BinarySourceDataset(Dataset):
-    """
-    二进制-源码配对数据集
-    
-    数据格式示例:
-    {
-        "asm_code": "push rbp\nmov rbp, rsp\n...",
-        "source_code": "int add(int a, int b) { return a + b; }",
-        "function_name": "add",
-        "label": 1  # 1表示同源，0表示不同源（如果有的话）
-    }
-    """
-    
-    def __init__(
-        self,
-        data_path: str,
-        tokenizer,
-        max_length: int = 2048,
-        asm_prompt_template: str = None,
-        source_prompt_template: str = None
-    ):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        
-        self.asm_prompt_template = "Analyze the following assembly code and understand its semantic meaning:\n"\
-            "```asm\n{code}\n```\n"\
-            "Semantic representation:"
-        self.source_prompt_template = "Analyze the following source code and understand its semantic meaning:\n"\
-            "```c\n{code}\n```\n"\
-            "Semantic representation:"
-        
-        # 加载数据
-        self.data = self._load_data(data_path)
-        logger.info(f"Loaded {len(self.data)} samples from {data_path}")
-    
-    def _load_data(self, data_path: str) -> List[Dict]:
-        """加载数据"""
-        with open(data_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return data
-    
-    def __len__(self) -> int:
-        return len(self.data)
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        item = self.data[idx]
-        
-        # 构建输入文本
-        asm_text = self.asm_prompt_template.format(code=item['asm_code'])
-        source_text = self.source_prompt_template.format(code=item['source_code'])
-        
-        # Tokenize
-        asm_encoding = self.tokenizer(
-            asm_text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        source_encoding = self.tokenizer(
-            source_text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        return {
-            'asm_input_ids': asm_encoding['input_ids'].squeeze(0),
-            'asm_attention_mask': asm_encoding['attention_mask'].squeeze(0),
-            'source_input_ids': source_encoding['input_ids'].squeeze(0),
-            'source_attention_mask': source_encoding['attention_mask'].squeeze(0),
-            'idx': idx
-        }
 
 
 class ProjectionHead(nn.Module):
@@ -189,137 +115,6 @@ class ProjectionHead(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.projection(x)
-
-
-class InfoNCELoss(nn.Module):
-    """
-    InfoNCE对比学习损失函数
-    
-    InfoNCE = -log(exp(sim(z_i, z_j)/τ) / Σ_k exp(sim(z_i, z_k)/τ))
-    
-    其中：
-    - z_i, z_j 是正样本对（同源的汇编和源码）
-    - z_k 是所有样本（包括正负样本）
-    - τ 是温度参数
-    """
-    
-    def __init__(self, temperature: float = 0.05):
-        super().__init__()
-        self.temperature = temperature
-    
-    def forward(
-        self,
-        asm_embeddings: torch.Tensor,
-        source_embeddings: torch.Tensor,
-        hard_negative_weight: float = 1.0
-    ) -> torch.Tensor:
-        """
-        计算InfoNCE损失
-        
-        Args:
-            asm_embeddings: 汇编代码嵌入 [batch_size, embedding_dim]
-            source_embeddings: 源代码嵌入 [batch_size, embedding_dim]
-            hard_negative_weight: 困难负样本权重
-        
-        Returns:
-            loss: 对比学习损失
-        """
-        batch_size = asm_embeddings.shape[0]
-        
-        # L2归一化
-        asm_embeddings = F.normalize(asm_embeddings, p=2, dim=1)
-        source_embeddings = F.normalize(source_embeddings, p=2, dim=1)
-        
-        # 计算相似度矩阵
-        # asm_embeddings @ source_embeddings.T -> [batch_size, batch_size]
-        # 对角线元素是正样本对的相似度
-        similarity_matrix = torch.matmul(asm_embeddings, source_embeddings.T) / self.temperature
-        
-        # 标签：对角线位置是正样本
-        labels = torch.arange(batch_size, device=asm_embeddings.device)
-        
-        # 计算损失（双向：asm->source 和 source->asm）
-        loss_asm_to_source = F.cross_entropy(similarity_matrix, labels)
-        loss_source_to_asm = F.cross_entropy(similarity_matrix.T, labels)
-        
-        loss = (loss_asm_to_source + loss_source_to_asm) / 2
-        
-        return loss
-
-
-class HardNegativeInfoNCELoss(nn.Module):
-    """
-    带困难负样本挖掘的InfoNCE损失
-    
-    困难负样本是那些与查询样本相似但实际上是负样本的例子，
-    它们对模型学习更有帮助。
-    """
-    
-    def __init__(
-        self,
-        temperature: float = 0.05,
-        hard_negative_weight: float = 1.0,
-        margin: float = 0.2
-    ):
-        super().__init__()
-        self.temperature = temperature
-        self.hard_negative_weight = hard_negative_weight
-        self.margin = margin
-    
-    def forward(
-        self,
-        asm_embeddings: torch.Tensor,
-        source_embeddings: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        计算带困难负样本的InfoNCE损失
-        """
-        batch_size = asm_embeddings.shape[0]
-        
-        # L2归一化
-        asm_embeddings = F.normalize(asm_embeddings, p=2, dim=1)
-        source_embeddings = F.normalize(source_embeddings, p=2, dim=1)
-        
-        # 计算相似度矩阵
-        sim_matrix = torch.matmul(asm_embeddings, source_embeddings.T) / self.temperature
-        
-        # 正样本掩码（对角线）
-        pos_mask = torch.eye(batch_size, device=asm_embeddings.device).bool()
-        
-        # 获取正样本相似度
-        pos_sim = sim_matrix[pos_mask]  # [batch_size]
-        
-        # 负样本相似度（非对角线元素）
-        neg_mask = ~pos_mask
-        neg_sim = sim_matrix[neg_mask].view(batch_size, batch_size - 1)  # [batch_size, batch_size-1]
-        
-        # 困难负样本：选择最相似的负样本
-        hard_neg_sim, _ = neg_sim.max(dim=1)  # [batch_size]
-        
-        # 计算损失
-        # 基础InfoNCE损失
-        labels = torch.arange(batch_size, device=asm_embeddings.device)
-        loss_basic = F.cross_entropy(sim_matrix, labels)
-        
-        # 困难负样本惩罚：确保正样本比困难负样本高出margin
-        hard_neg_penalty = F.relu(hard_neg_sim - pos_sim + self.margin).mean()
-        
-        total_loss = loss_basic + self.hard_negative_weight * hard_neg_penalty
-        
-        # 计算一些指标
-        with torch.no_grad():
-            accuracy = (sim_matrix.argmax(dim=1) == labels).float().mean().item()
-            mean_pos_sim = pos_sim.mean().item() * self.temperature
-            mean_neg_sim = neg_sim.mean().item() * self.temperature
-        
-        metrics = {
-            'accuracy': accuracy,
-            'mean_pos_sim': mean_pos_sim,
-            'mean_neg_sim': mean_neg_sim,
-            'hard_neg_penalty': hard_neg_penalty.item()
-        }
-        
-        return total_loss, metrics
 
 
 class ContrastiveModel(nn.Module):
@@ -356,7 +151,7 @@ class ContrastiveModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        pooling_strategy: str = 'last_token'
+        pooling_strategy: str = 'mean'
     ) -> torch.Tensor:
         """
         获取序列的嵌入表示
@@ -451,7 +246,7 @@ class ContrastiveTrainer:
         self.device = device
         
         # 损失函数
-        self.loss_fn = HardNegativeInfoNCELoss(
+        self.loss_fn = HardNegativeInfoNCELossWithLabels(
             temperature=config.temperature,
             hard_negative_weight=config.hard_negative_weight
         )
@@ -482,7 +277,7 @@ class ContrastiveTrainer:
         
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                if 'projection_head' in name:
+                if 'lm_head' in name:
                     projection_params.append(param)
                 else:
                     base_params.append(param)
@@ -502,19 +297,20 @@ class ContrastiveTrainer:
         num_batches = 0
         
         progress_bar = tqdm(
-            self.train_dataloader,
+            enumerate(self.train_dataloader),
             desc=f"Epoch {epoch + 1}/{self.config.num_epochs}",
             leave=True
         )
         
         self.optimizer.zero_grad()
         
-        for step, batch in enumerate(progress_bar):
+        for step, batch in progress_bar:
             # 移动数据到设备
             asm_input_ids = batch['asm_input_ids'].to(self.device)
             asm_attention_mask = batch['asm_attention_mask'].to(self.device)
             source_input_ids = batch['source_input_ids'].to(self.device)
             source_attention_mask = batch['source_attention_mask'].to(self.device)
+            labels = batch["label"].to(self.device)
             
             # 混合精度训练
             if self.config.fp16:
@@ -523,7 +319,7 @@ class ContrastiveTrainer:
                         asm_input_ids, asm_attention_mask,
                         source_input_ids, source_attention_mask
                     )
-                    loss, metrics = self.loss_fn(asm_emb, source_emb)
+                    loss, metrics = self.loss_fn(asm_emb, source_emb, labels)
                     loss = loss / self.config.gradient_accumulation_steps
                 
                 self.scaler.scale(loss).backward()
@@ -532,7 +328,7 @@ class ContrastiveTrainer:
                     asm_input_ids, asm_attention_mask,
                     source_input_ids, source_attention_mask
                 )
-                loss, metrics = self.loss_fn(asm_emb, source_emb)
+                loss, metrics = self.loss_fn(asm_emb, source_emb, labels)
                 loss = loss / self.config.gradient_accumulation_steps
                 loss.backward()
             
@@ -824,11 +620,11 @@ def main():
     parser.add_argument('--train_data', type=str, default='resources/datasets/train_dataset.csv')
     parser.add_argument('--val_data', type=str, default='resources/datasets/eval_dataset.csv')
     parser.add_argument('--output_dir', type=str, default='outputs')
-    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--learning_rate', type=float, default=2e-5)
     parser.add_argument('--num_epochs', type=int, default=10)
     parser.add_argument('--temperature', type=float, default=0.05)
-    parser.add_argument('--max_seq_length', type=int, default=1024)
+    parser.add_argument('--max_seq_length', type=int, default=512)
     parser.add_argument('--create_sample_data', action='store_true')
     parser.add_argument('--use_wandb', action='store_true')
     
