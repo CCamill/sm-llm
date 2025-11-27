@@ -7,5 +7,4 @@
 *.log
 resources
 src/third_party
-test
 milvus_demo.db

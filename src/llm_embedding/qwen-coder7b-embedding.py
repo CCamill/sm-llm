@@ -128,7 +128,7 @@ class QwenCoderEmbedding:
             )
         except Exception as e:
             print(f"Flash Attention 加载失败，回退到 SDPA: {e}")
-            self.model = AutoModelForCausalLM.from_pretrained(
+            self.model = git AutoModelForCausalLM.from_pretrained(
                 model_name,
                 quantization_config=quantization_config,
                 device_map=device_map,
