@@ -37,7 +37,6 @@ class LLMSimilarityCalculator:
         self.model_name = model_name
         self.logger = logging.getLogger(__name__)
         
-        # 初始化LLM
         self.llm = Ollama(
             model=model_name,
             base_url=ollama_url,
@@ -45,10 +44,8 @@ class LLMSimilarityCalculator:
             top_p=0.9,
         )
         
-        # 创建提示词模板
         self.prompt_template = self._create_prompt_template()
         
-        # 创建处理链
         self.chain = self.prompt_template | self.llm | StrOutputParser() | RunnableLambda(self._parse_similarity)
         
     def _create_prompt_template(self) -> ChatPromptTemplate:

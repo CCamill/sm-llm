@@ -68,7 +68,7 @@ def detect_toolchains() -> List[Toolchain]:
         objdump_flags = ["-d"]
         if native_arch in {"x86_64", "amd64"}:
             # 使用 Intel 汇编语法便于阅读
-            objdump_flags = ["-d", "-Mintel,x86-64"]
+            objdump_flags = ["-d", "-Mintel,x86-64", "--no-show-raw-insn"]
         
         # 基础编译参数
         base_cflags = ["-c", "-O2", "-fno-asynchronous-unwind-tables"]
@@ -297,7 +297,7 @@ def create_json_output(functions: List[Dict[str, Any]], meta: Dict[str, Any]) ->
     }
 
 
-def process_all() -> None:
+def process_all(if_complier: bool=False, if_disasm: bool=False) -> None:
     logger = setup_logging(PROJECT_ROOT)
 
     input_candidates = [
@@ -353,17 +353,18 @@ def process_all() -> None:
                     input_base, obj_base, asm_base, asm_funcs_base, src_path, arch_prefix
                 )
 
-                # 编译
-                ok_compile = compile_to_object(chain, src_path, obj_path, PROJECT_ROOT)
-                if not ok_compile:
-                    logger.error(f"编译失败({chain.arch}): {src_path}")
-                    continue
-
-                # 反汇编
-                ok_disas = disassemble_object(chain, obj_path, asm_path)
-                if not ok_disas:
-                    logger.error(f"反汇编失败({chain.arch}): {obj_path}")
-                    continue
+                if if_complier:
+                    # 编译
+                    ok_compile = compile_to_object(chain, src_path, obj_path, PROJECT_ROOT)
+                    if not ok_compile:
+                        logger.error(f"编译失败({chain.arch}): {src_path}")
+                        continue
+                if if_disasm:
+                    # 反汇编
+                    ok_disas = disassemble_object(chain, obj_path, asm_path)
+                    if not ok_disas:
+                        logger.error(f"反汇编失败({chain.arch}): {obj_path}")
+                        continue
 
                 # 解析函数
                 try:
