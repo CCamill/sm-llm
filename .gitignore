@@ -3,6 +3,7 @@
 .venv/
 **/__pycache__/
 *.json
+!ds_config.json
 *.ll
 *.log
 resources
