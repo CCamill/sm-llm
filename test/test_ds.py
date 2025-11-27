@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""
+测试 DeepSpeed 分布式训练功能
+"""
 import torch
 import torch.nn as nn
 import deepspeed

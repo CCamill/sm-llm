@@ -4,7 +4,7 @@ import pandas as pd
 
 
 class FuncDataset(Dataset):
-    def __init__(self, csv_file: str, items_num: int = None, ratio_pos_neg: int = 0.5, task_type: str = "matching"):
+    def __init__(self, csv_file: str, items_num: int = None, ratio_pos_neg: int = 0.5, task_type: str = "matching", asm_prompt_template:str=None, source_prompt_template:str=None):
         """
         自定义数据集类，用于加载函数对数据。
         Args:
@@ -17,6 +17,16 @@ class FuncDataset(Dataset):
         self.data_frame = data_frame if items_num is None else data_frame.iloc[:items_num]
         self.ratio_pos_neg = ratio_pos_neg
         self.task_type = task_type
+        self.asm_prompt_template = asm_prompt_template or (
+            "Analyze the following assembly code and understand its semantic meaning:\n"
+            "```asm\n{code}\n```\n"
+            "Semantic representation:"
+        )
+        self.source_prompt_template = source_prompt_template or (
+            "Analyze the following source code and understand its semantic meaning:\n"
+            "```c\n{code}\n```\n"
+            "Semantic representation:"
+        )
     
     def __len__(self):
         return len(self.data_frame)
@@ -39,5 +49,7 @@ class FuncDataset(Dataset):
             else:
                 return pair1, pair2, pair3
         if self.task_type=="selection":
+            asm_func_1 = self.asm_prompt_template.format(code=asm_func_1)
+            src_func_1 = self.source_prompt_template.format(code=src_func_1)
             return asm_func_1, src_func_1, 1
     

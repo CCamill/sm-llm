@@ -122,7 +122,7 @@ class QwenCoderEmbedding:
                 device_map=device_map,
                 max_memory=max_memory,
                 trust_remote_code=True,
-                dtype=torch.bfloat16,
+                dtype=torch.bfloat16 if quantization == "none" else None,
                 attn_implementation=attn_implementation,
                 low_cpu_mem_usage=True,
             )
@@ -134,10 +134,11 @@ class QwenCoderEmbedding:
                 device_map=device_map,
                 max_memory=max_memory,
                 trust_remote_code=True,
-                dtype=torch.bfloat16,
+                dtype=torch.bfloat16 if quantization == "none" else None,
                 attn_implementation="sdpa",
                 low_cpu_mem_usage=True,
             )
+        print(self.model)
         
         self.model.eval()
         
@@ -249,13 +250,14 @@ def main():
     parser.add_argument("--data_path", type=str, default="resources/datasets/dataset.csv", help="数据路径")
     parser.add_argument('--ratio_pos_neg', type=float, default=0.5, help='Ratio of positive to negative samples [0.5, 1.0]')
     parser.add_argument('--items_num', type=int, default=None, help='Number of items to load from the dataset')
+    parser.add_argument("--pooling_method", type=str, default="mean", help="最大序列长度")
     args = parser.parse_args()
 
     dataset = FuncDataset(args.data_path, items_num=args.items_num, ratio_pos_neg=args.ratio_pos_neg, task_type="selection")
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
     model_list = ["Qwen/Qwen2.5-Coder-7B", "Qwen/Qwen3-Coder-30B-A3B"]
-    model_name = "Qwen/Qwen3-Coder-30B-A3B"
+    model_name = "Qwen/Qwen2.5-Coder-7B"
     cpu_offload = False
     if model_name == "Qwen/Qwen3-Coder-30B-A3B":
         cpu_offload = True
@@ -269,6 +271,7 @@ def main():
     )
     logger = setup_logger(f"{model_name.split('/')[-1]}-embedding", args.log_path)
     logger.info("==================================================================")
+    logger.info(f"Pooling method: {args.pooling_method}")
     logger.info(f"Log path: {args.log_path}")
     logger.info(f"Evaluating model: {model_name}")
     logger.info("量化方式: {}".format(args.quantization))
@@ -284,8 +287,8 @@ def main():
         anchor = []
         pos = []
         for asm_func, src_func, label in zip(asm_funcs, src_funcs, labels):
-            asm_emb = embedder.get_embedding(asm_func, pooling="last")
-            src_emb = embedder.get_embedding(src_func, pooling="last")
+            asm_emb = embedder.get_embedding(asm_func, pooling=args.pooling_method)
+            src_emb = embedder.get_embedding(src_func, pooling=args.pooling_method)
             anchor.append(asm_emb)
             pos.append(src_emb)
         

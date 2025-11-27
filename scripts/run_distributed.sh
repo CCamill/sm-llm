@@ -46,6 +46,8 @@ echo "Hostfile 内容:"
 cat "$HOSTFILE"
 echo ""
 
+conda activate deepspeed
+
 # 使用 DeepSpeed launcher 启动
 deepspeed \
     --hostfile="$HOSTFILE" \
