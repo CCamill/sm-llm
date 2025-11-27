@@ -112,17 +112,12 @@ class BinarySourceDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         
-        # 默认提示模板
-        self.asm_prompt_template = asm_prompt_template or (
-            "Analyze the following assembly code and understand its semantic meaning:\n"
-            "```asm\n{code}\n```\n"
+        self.asm_prompt_template = "Analyze the following assembly code and understand its semantic meaning:\n"\
+            "```asm\n{code}\n```\n"\
             "Semantic representation:"
-        )
-        self.source_prompt_template = source_prompt_template or (
-            "Analyze the following source code and understand its semantic meaning:\n"
-            "```c\n{code}\n```\n"
+        self.source_prompt_template = "Analyze the following source code and understand its semantic meaning:\n"\
+            "```c\n{code}\n```\n"\
             "Semantic representation:"
-        )
         
         # 加载数据
         self.data = self._load_data(data_path)
@@ -826,8 +821,8 @@ ret""",
 def main():
     parser = argparse.ArgumentParser(description='Contrastive Learning for Binary-Source Similarity')
     parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-Coder-7B-Instruct')
-    parser.add_argument('--train_data', type=str, default='data/train.json')
-    parser.add_argument('--val_data', type=str, default='data/val.json')
+    parser.add_argument('--train_data', type=str, default='resources/datasets/train_dataset.csv')
+    parser.add_argument('--val_data', type=str, default='resources/datasets/eval_dataset.csv')
     parser.add_argument('--output_dir', type=str, default='outputs')
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--learning_rate', type=float, default=2e-5)
