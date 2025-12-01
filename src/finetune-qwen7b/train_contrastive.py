@@ -34,16 +34,27 @@ import argparse
 from pathlib import Path
 import wandb
 import pandas as pd
+import time
 
-from loss_func import HardNegativeInfoNCELossWithLabels
+from loss_func import HardNegativeInfoNCELossWithLabels, LabeledContrastiveLoss
 from playdata import BinarySourceDataset
 
-# 设置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+
+def setup_logger(name: str, log_path: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(log_path)
+    fh.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+logger = setup_logger(name = 'finetune', log_path=f"resources/logs/Qwen-Finetune-{time.time()}.log")
 
 
 @dataclass
@@ -82,13 +93,14 @@ class TrainingConfig:
     val_data_path: str = "data/val.json"
     
     # 其他
-    output_dir: str = "outputs"
+    output_dir: str = "resources/finetune_modules"
     save_steps: int = 500
     eval_steps: int = 100
     logging_steps: int = 10
     seed: int = 42
-    fp16: bool = True
+    fp16: bool = False  # 是否混合精度
     use_wandb: bool = False
+    fintune_layers: int = 4
 
 
 class ProjectionHead(nn.Module):
@@ -202,6 +214,7 @@ class ContrastiveModel(nn.Module):
         
         # 通过投影头
         if self.use_projection_head and self.projection_head is not None:
+            embeddings = embeddings.to(self.projection_head.projection[0].weight.dtype)
             embeddings = self.projection_head(embeddings)
         
         return embeddings
@@ -246,7 +259,7 @@ class ContrastiveTrainer:
         self.device = device
         
         # 损失函数
-        self.loss_fn = HardNegativeInfoNCELossWithLabels(
+        self.loss_fn = LabeledContrastiveLoss(
             temperature=config.temperature,
             hard_negative_weight=config.hard_negative_weight
         )
@@ -299,6 +312,7 @@ class ContrastiveTrainer:
         progress_bar = tqdm(
             enumerate(self.train_dataloader),
             desc=f"Epoch {epoch + 1}/{self.config.num_epochs}",
+            ncols=150,
             leave=True
         )
         
@@ -378,20 +392,20 @@ class ContrastiveTrainer:
                             'train/neg_sim': total_metrics['mean_neg_sim'] / num_batches,
                         }, step=self.global_step)
                 
-                # 评估
-                if self.val_dataloader and self.global_step % self.config.eval_steps == 0:
-                    eval_metrics = self.evaluate()
-                    logger.info(f"Step {self.global_step} - Eval MRR: {eval_metrics['mrr']:.4f}")
+                # # 评估
+                # if self.val_dataloader and self.global_step % self.config.eval_steps == 0:
+                #     eval_metrics = self.evaluate()
+                #     logger.info(f"Step {self.global_step} - Eval MRR: {eval_metrics['mrr']:.4f}")
                     
-                    if eval_metrics['mrr'] > self.best_mrr:
-                        self.best_mrr = eval_metrics['mrr']
-                        self.save_checkpoint('best')
+                #     if eval_metrics['mrr'] > self.best_mrr:
+                #         self.best_mrr = eval_metrics['mrr']
+                #         self.save_checkpoint('best')
                     
-                    self.model.train()
+                #     self.model.train()
                 
-                # 保存检查点
-                if self.global_step % self.config.save_steps == 0:
-                    self.save_checkpoint(f'step_{self.global_step}')
+                # # 保存检查点
+                # if self.global_step % self.config.save_steps == 0:
+                #     self.save_checkpoint(f'step_{self.global_step}')
         
         return {
             'loss': total_loss / num_batches,
@@ -544,74 +558,31 @@ class ContrastiveTrainer:
         logger.info(f"Training completed. Best MRR: {self.best_mrr:.4f}")
 
 
-def create_sample_data():
-    """创建示例数据用于测试"""
-    sample_data = [
-        {
-            "asm_code": """push rbp
-mov rbp, rsp
-mov DWORD PTR [rbp-4], edi
-mov DWORD PTR [rbp-8], esi
-mov eax, DWORD PTR [rbp-4]
-add eax, DWORD PTR [rbp-8]
-pop rbp
-ret""",
-            "source_code": """int add(int a, int b) {
-    return a + b;
-}""",
-            "function_name": "add"
-        },
-        {
-            "asm_code": """push rbp
-mov rbp, rsp
-mov DWORD PTR [rbp-4], edi
-mov DWORD PTR [rbp-8], esi
-mov eax, DWORD PTR [rbp-4]
-imul eax, DWORD PTR [rbp-8]
-pop rbp
-ret""",
-            "source_code": """int multiply(int x, int y) {
-    return x * y;
-}""",
-            "function_name": "multiply"
-        },
-        {
-            "asm_code": """push rbp
-mov rbp, rsp
-mov DWORD PTR [rbp-4], edi
-cmp DWORD PTR [rbp-4], 1
-jg .L2
-mov eax, 1
-jmp .L3
-.L2:
-mov eax, DWORD PTR [rbp-4]
-sub eax, 1
-mov edi, eax
-call factorial
-imul eax, DWORD PTR [rbp-4]
-.L3:
-pop rbp
-ret""",
-            "source_code": """int factorial(int n) {
-    if (n <= 1) return 1;
-    return n * factorial(n - 1);
-}""",
-            "function_name": "factorial"
-        }
-    ]
+def setup_qlora_selective_training(model, num_layers_to_train=14):
+    """
+    为QLoRA设置选择性训练，只训练最后N层
+    """
+    total_layers = len(model.model.layers)
+    start_layer = total_layers - num_layers_to_train
     
-    # 复制多份以创建足够的训练数据
-    expanded_data = sample_data * 20
+    print(f"总层数: {total_layers}, 训练层: {start_layer}到{total_layers-1}")
     
-    os.makedirs('data', exist_ok=True)
+    # 构建目标模块列表，只包含最后14层的模块
+    target_modules = []
+    for layer_idx in range(start_layer, total_layers):
+        # 添加该层的所有目标模块
+        layer_prefix = f"model.layers.{layer_idx}."
+        target_modules.extend([
+            f"{layer_prefix}self_attn.q_proj",
+            f"{layer_prefix}self_attn.k_proj", 
+            f"{layer_prefix}self_attn.v_proj",
+            f"{layer_prefix}self_attn.o_proj",
+            f"{layer_prefix}mlp.gate_proj",
+            f"{layer_prefix}mlp.up_proj",
+            f"{layer_prefix}mlp.down_proj"
+        ])
     
-    with open('data/train.json', 'w') as f:
-        json.dump(expanded_data[:50], f, indent=2)
-    
-    with open('data/val.json', 'w') as f:
-        json.dump(expanded_data[50:], f, indent=2)
-    
-    logger.info("Sample data created in data/ directory")
+    return target_modules
 
 
 def main():
@@ -619,20 +590,17 @@ def main():
     parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-Coder-7B-Instruct')
     parser.add_argument('--train_data', type=str, default='resources/datasets/train_dataset.csv')
     parser.add_argument('--val_data', type=str, default='resources/datasets/eval_dataset.csv')
-    parser.add_argument('--output_dir', type=str, default='outputs')
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--output_dir', type=str, default='resources/finetune_modules')
+    parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--learning_rate', type=float, default=2e-5)
     parser.add_argument('--num_epochs', type=int, default=10)
     parser.add_argument('--temperature', type=float, default=0.05)
     parser.add_argument('--max_seq_length', type=int, default=512)
-    parser.add_argument('--create_sample_data', action='store_true')
     parser.add_argument('--use_wandb', action='store_true')
+    parser.add_argument('--fintune_layers', type=int, default=4)
     
     args = parser.parse_args()
     
-    # 创建示例数据（如果需要）
-    if args.create_sample_data:
-        create_sample_data()
     
     # 配置
     config = TrainingConfig(
@@ -645,7 +613,8 @@ def main():
         num_epochs=args.num_epochs,
         temperature=args.temperature,
         max_seq_length=args.max_seq_length,
-        use_wandb=args.use_wandb
+        use_wandb=args.use_wandb,
+        fintune_layers = args.fintune_layers
     )
     
     # 初始化wandb
@@ -691,20 +660,25 @@ def main():
         device_map='auto'
     )
     
+    
+    logger.info(f"finetune last {config.fintune_layers} decoder layers")
+    lora_target_modules = setup_qlora_selective_training(base_model, config.fintune_layers)
+    
     # 配置LoRA
     logger.info("Configuring LoRA...")
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
         lora_dropout=config.lora_dropout,
-        target_modules=config.lora_target_modules,
+        target_modules=lora_target_modules,
         bias="none",
         task_type=TaskType.CAUSAL_LM
     )
     
     base_model = get_peft_model(base_model, lora_config)
-    base_model.print_trainable_parameters()
+    base_model.print_trainable_parameters(logger)
     
+    compute_dtype = quantization_config.bnb_4bit_compute_dtype
     # 创建对比学习模型
     hidden_size = base_model.config.hidden_size
     contrastive_model = ContrastiveModel(
@@ -715,6 +689,10 @@ def main():
         dropout=config.lora_dropout
     )
     contrastive_model = contrastive_model.to(device)
+    if contrastive_model.use_projection_head:
+        # 将 ProjectionHead 的参数和 buffer 转换为 compute_dtype
+        contrastive_model.projection_head.to(compute_dtype)
+        logger.info(f"ProjectionHead successfully set to dtype: {compute_dtype}")
     
     # 创建数据集和数据加载器
     logger.info("Loading datasets...")

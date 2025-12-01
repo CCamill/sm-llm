@@ -7,12 +7,13 @@ import random
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-def build_datasets():
+def build_small_datasets():
     # 读取完整数据集
     pos_df = pd.read_csv("resources/datasets/dataset.csv")
     pos_df["label"] = 1  # 正样本标签为1
     pos_df.drop('signature', axis=1, inplace=True)
     pos_df.drop('func_name', axis=1, inplace=True)
+
     neg_list = []
     len_df = len(pos_df)
     for idx in range(len_df):
@@ -60,5 +61,8 @@ def build_datasets():
 
     print(f"训练集大小: {len(train_df)}, 评估集大小: {len(val_df)}, 测试机大小：{len(test_df)}")
 
+
+def build_dataset():
+    
 if __name__ == "__main__":
     build_datasets()

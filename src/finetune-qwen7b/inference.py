@@ -7,10 +7,12 @@
 3. 计算相似度和检索
 """
 
+import argparse
 import os
 import json
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 import numpy as np
@@ -19,23 +21,42 @@ from dataclasses import dataclass
 from pathlib import Path
 import logging
 from tqdm import tqdm
+import time
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from playdata import FuncDataset
+
+def setup_logger(name: str, log_path: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(log_path)
+    fh.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+logger = setup_logger(name = 'inference', log_path=f"resources/logs/Qwen-inference-{time.time()}.log")
 
 
 @dataclass
 class InferenceConfig:
     """推理配置"""
     model_name: str = "Qwen/Qwen2.5-Coder-7B"
-    lora_path: str = "outputs/best/lora_weights"
-    projection_head_path: str = "outputs/best/projection_head.pt"
-    max_seq_length: int = 2048
+    lora_path: str = "resources/finetune_modules/best/lora_weights"
+    projection_head_path: str = "resources/finetune_modules/best/projection_head.pt"
+    max_seq_length: int = 512
     batch_size: int = 32
     use_projection_head: bool = True
-    pooling_strategy: str = 'last_token'  # 'last_token', 'mean', 'eos'
+    pooling_strategy: str = 'mean'  # 'last_token', 'mean', 'eos'
     normalize_embeddings: bool = True
-    fp16: bool = True
+    fp16: bool = True,
+    ratio_pos_neg: int=0.5,
+    items_num: int=None,
+    data_path:str ="resources/datasets/dataset.csv"
 
 
 class ProjectionHead(torch.nn.Module):
@@ -86,7 +107,6 @@ class BinarySourceEmbedder:
     
     def _load_model(self):
         """加载模型"""
-        logger.info(f"Loading tokenizer: {self.config.model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_name,
             trust_remote_code=True
@@ -94,17 +114,15 @@ class BinarySourceEmbedder:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        logger.info(f"Loading base model: {self.config.model_name}")
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name,
-            torch_dtype=torch.bfloat16 if self.config.fp16 else torch.float32,
+            dtype=torch.bfloat16 if self.config.fp16 else torch.float32,
             trust_remote_code=True,
             device_map='auto'
         )
         
         # 加载LoRA权重
         if os.path.exists(self.config.lora_path):
-            logger.info(f"Loading LoRA weights: {self.config.lora_path}")
             self.model = PeftModel.from_pretrained(
                 self.model,
                 self.config.lora_path
@@ -114,7 +132,6 @@ class BinarySourceEmbedder:
         # 加载投影头
         self.projection_head = None
         if self.config.use_projection_head and os.path.exists(self.config.projection_head_path):
-            logger.info(f"Loading projection head: {self.config.projection_head_path}")
             hidden_size = self.model.config.hidden_size
             self.projection_head = ProjectionHead(hidden_size)
             self.projection_head.load_state_dict(
@@ -201,8 +218,7 @@ class BinarySourceEmbedder:
         
         batch_size = batch_size or self.config.batch_size
         all_embeddings = []
-        
-        for i in tqdm(range(0, len(asm_codes), batch_size), desc="Encoding assembly"):
+        for i in range(0, len(asm_codes), batch_size):
             batch = asm_codes[i:i + batch_size]
             texts = [self.asm_prompt_template.format(code=code) for code in batch]
             
@@ -451,45 +467,73 @@ class SimilarityEvaluator:
         return metrics
 
 
-def demo():
+def main():
     """演示使用方法"""
     config = InferenceConfig(
-        model_name="Qwen/Qwen2.5-Coder-7B",
-        lora_path="outputs/best/lora_weights",
-        projection_head_path="outputs/best/projection_head.pt",
+        model_name="Qwen/Qwen2.5-Coder-7B-Instruct",
+        lora_path="resources/finetune_modules/best/lora_weights",
+        projection_head_path="resources/finetune_modules/best/projection_head.pt",
         use_projection_head=True,
-        batch_size=32
+        batch_size=32,
+        ratio_pos_neg=0.5,
+        items_num=None,
+        data_path="resources/datasets/test_dataset.csv",
     )
+    parser = argparse.ArgumentParser(description="QLora Moder inference")
+    parser.add_argument("--finetune_layers", type=int, default=4)
+
+    args = parser.parse_args()
+    logger.info(f"data_path: {config.data_path}")
+    logger.info(f"model name: {config.model_name} QLora")
+    logger.info(f"fine-tuned layers: {args.finetune_layers}")
+    logger.info(f"ratio_pos_neg: {config.ratio_pos_neg}")
+    logger.info(f"batch_size: {config.batch_size}")
+    logger.info(f"pooling_strategy: {config.pooling_strategy}")
     
     embedder = BinarySourceEmbedder(config)
-    
-    # 示例代码
-    asm_code = """
-    push rbp
-    mov rbp, rsp
-    mov DWORD PTR [rbp-4], edi
-    mov DWORD PTR [rbp-8], esi
-    mov eax, DWORD PTR [rbp-4]
-    add eax, DWORD PTR [rbp-8]
-    pop rbp
-    ret
-    """
-    
-    source_code = """
-    int add(int a, int b) {
-        return a + b;
-    }
-    """
-    
-    # 获取嵌入
-    asm_emb = embedder.encode_assembly(asm_code)
-    src_emb = embedder.encode_source(source_code)
-    
-    # 计算相似度
-    similarity = embedder.compute_similarity(asm_emb, src_emb)[0, 0]
-    
-    print(f"Assembly-Source Similarity: {similarity:.4f}")
 
+    dataset = FuncDataset(config.data_path, items_num=config.items_num, ratio_pos_neg=config.ratio_pos_neg, task_type="selection")
+    logger.info(f"asm-src func pairs: {len(dataset)}")
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+    progress_bar = tqdm(enumerate(dataloader), 
+                        total=len(dataloader),
+                        desc=f"Evaluating",
+                        ncols=150)
+    avg = []
+    gt = []
 
+    for idx, (asm_funcs, src_funcs, labels) in progress_bar:
+        anchor = []
+        pos = []
+        for asm_func, src_func, label in zip(asm_funcs, src_funcs, labels):
+            asm_emb = embedder.encode_assembly(asm_func)
+            src_emb = embedder.encode_assembly(src_func)
+            anchor.append(asm_emb)
+            pos.append(src_emb)
+        
+        ans = 0
+        for i in range(len(anchor)):
+            vA=torch.tensor(anchor[i]).cpu()
+            sim=[]
+            for j in range(len(pos)):
+                vB=torch.tensor(pos[j]).cpu()
+                AB_sim = F.cosine_similarity(vA, vB).item()
+                sim.append(AB_sim)
+            sim=np.array(sim)
+            y=np.argsort(-sim)
+            posi = 0
+            for j in range(len(pos)):
+                if y[j]==i:
+                    posi=j+1
+                    break
+            
+            gt.append(sim[i])
+
+            ans += 1/posi
+        ans = ans /len(anchor)
+        avg.append(ans)
+    logger.info(f"Mean Reciprocal Rank (MRR): {np.mean(np.array(avg))}")
+
+    
 if __name__ == '__main__':
-    demo()
+    main()

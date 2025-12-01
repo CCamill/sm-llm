@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 
 
-def setup_logging(project_root: str, log_prefix: str = "split_func") -> logging.Logger:
+def setup_logging(log_prefix: str = "split_func") -> logging.Logger:
     """设置日志配置，将日志保存到resources/logs/{current_time}_{log_prefix}.log。
     
     Args:
@@ -18,13 +18,10 @@ def setup_logging(project_root: str, log_prefix: str = "split_func") -> logging.
     Returns:
         配置好的logger实例
     """
-    # 创建logs目录
-    logs_dir = os.path.join(project_root, "resources", "logs")
-    os.makedirs(logs_dir, exist_ok=True)
     
     # 生成日志文件名（包含当前时间）
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(logs_dir, f"{current_time}_{log_prefix}.log")
+    log_file = os.path.join(r"resources/logs", f"{current_time}_{log_prefix}.log")
     
     # 配置日志格式
     logging.basicConfig(

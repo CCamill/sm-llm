@@ -1,4 +1,6 @@
 """
+从常用第三方库构建构建数据集
+包括个各别代码优化
 批量多进程处理 .o 文件，保持目录结构
 obj/项目/xxx.o -> ida_funcs/项目/xxx.csv
 每个 .csv 文件包含函数名、汇编代码等信息
@@ -11,6 +13,40 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import shutil
 import tempfile
+from tqdm import tqdm
+import logging
+from datetime import datetime
+
+def setup_logging(log_prefix: str = "split_func") -> logging.Logger:
+    """设置日志配置，将日志保存到resources/logs/{current_time}_{log_prefix}.log。
+    
+    Args:
+        project_root: 项目根目录路径
+        log_prefix: 日志文件名前缀
+        
+    Returns:
+        配置好的logger实例
+    """
+    
+    # 生成日志文件名（包含当前时间）
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(r"resources/logs", f"{current_time}_{log_prefix}.log")
+    
+    # 配置日志格式
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file, encoding='utf-8'),
+            logging.StreamHandler()  # 同时输出到控制台
+        ]
+    )
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"日志系统初始化完成，日志文件: {log_file}")
+    return logger
+
+logger = setup_logging("split-asm-funcs")
 
 def get_ida_path():
     """获取 IDA Pro 可执行文件路径"""
@@ -39,10 +75,11 @@ def process_single_file_wrapper(args):
     input_file = args
     return process_single_file(input_file)
 
-def process_single_file(input_file):
+def process_single_file(proj_name, opti, input_file):
     """处理单个文件，保持目录结构"""
     try:
-        output_csv_path = input_file.replace('/obj/', '/ida_funcs/').replace('.o', '.csv')
+        file_name = input_file.split('/')[-1].replace('o', 'csv')
+        output_csv_path = os.path.join(r"resources/datasets/ida_funcs/", proj_name, opti, file_name)
         
         os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
         
@@ -262,8 +299,42 @@ def print_output_structure(output_dir, max_depth=3):
                 print(f"{sub_indent}{file}")
 
 if __name__ == "__main__":
-    input_dir = r"resources/datasets/obj"
-    output_base_dir = r"resources/datasets/ida_funcs"
+    o_dictory = r"/home/lab314/cjw/sm_sog/resources/dataset/gcc/gcc_o"
+    src_dictory = r"resources/datasets/source_funcs_treesitter"
+    src_projs = os.listdir(src_dictory)
 
-    # 开始处理
-    batch_process_with_structure(input_dir, output_base_dir)
+    optimizers = ['-O0', '-O1', '-O2', '-O3', '-Ofast', '-Os']
+    len_src_projs = len(src_projs)
+
+    for idx, src_proj in enumerate(src_projs):
+        output_csv_proj = os.path.join(r"resources/datasets/ida_funcs/", src_proj)
+        if os.path.exists(output_csv_proj):
+            logger.info(f"跳过已处理项目: {src_proj}")
+            continue
+        logger.info(f"Processing {src_proj} {idx}/{len_src_projs}")
+        src_proj_path = os.path.join(src_dictory, src_proj)
+        if not os.path.isdir(src_proj_path):
+            logger.info(f"{src_proj_path} 不是目录，跳过")
+            continue
+        src_files = os.listdir(src_proj_path)
+        src_files = [f.split('.')[0] for f in src_files]
+        progress_bar = tqdm(
+            src_files,
+            desc=f"processing {src_proj}",
+            ncols=150,
+        )
+        success_count = 0
+        for file_name in src_files:
+            o_files = []
+            for opti in optimizers:
+                o_proj_dir = os.path.join(o_dictory, src_proj)
+                o_file_path = os.path.join(o_proj_dir, opti, file_name+'.o')
+                if not os.path.exists(o_file_path):
+                    continue
+                input_file, success, message = process_single_file(src_proj, opti, o_file_path)
+                logger.info(message)
+                success_count += int(success)
+        logger.info(f"{src_proj} success files: {success_count}")
+                    
+            
+
