@@ -35,8 +35,9 @@ from pathlib import Path
 import wandb
 import pandas as pd
 import time
+from datetime import datetime
 
-from loss_func import HardNegativeInfoNCELossWithLabels, LabeledContrastiveLoss
+from loss_func import HardNegativeInfoNCELossWithLabels, LabeledContrastiveLoss, VectorizedLabeledInfoNCELoss, PairwiseCosineLoss
 from playdata import BinarySourceDataset
 
 
@@ -73,7 +74,8 @@ class TrainingConfig:
     ])
     
     # 训练配置
-    batch_size: int = 16
+    train_batch_size: int = 16
+    eval_batch_size: int = 32
     gradient_accumulation_steps: int = 4
     learning_rate: float = 2e-5
     num_epochs: int = 10
@@ -91,6 +93,7 @@ class TrainingConfig:
     max_seq_length: int = 512
     train_data_path: str = "data/train.json"
     val_data_path: str = "data/val.json"
+    test_data_path: str = "data/test.json"
     
     # 其他
     output_dir: str = "resources/finetune_modules"
@@ -249,20 +252,19 @@ class ContrastiveTrainer:
         model: ContrastiveModel,
         train_dataloader: DataLoader,
         val_dataloader: Optional[DataLoader],
+        test_dataloader: Optional[DataLoader],
         config: TrainingConfig,
         device: torch.device
     ):
         self.model = model
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
+        self.test_dataloader = test_dataloader
         self.config = config
         self.device = device
         
         # 损失函数
-        self.loss_fn = LabeledContrastiveLoss(
-            temperature=config.temperature,
-            hard_negative_weight=config.hard_negative_weight
-        )
+        self.loss_fn = PairwiseCosineLoss()
         
         # 优化器
         self.optimizer = self._create_optimizer()
@@ -311,6 +313,7 @@ class ContrastiveTrainer:
         
         progress_bar = tqdm(
             enumerate(self.train_dataloader),
+            total=len(self.train_dataloader),
             desc=f"Epoch {epoch + 1}/{self.config.num_epochs}",
             ncols=150,
             leave=True
@@ -391,26 +394,12 @@ class ContrastiveTrainer:
                             'train/pos_sim': total_metrics['mean_pos_sim'] / num_batches,
                             'train/neg_sim': total_metrics['mean_neg_sim'] / num_batches,
                         }, step=self.global_step)
-                
-                # # 评估
-                # if self.val_dataloader and self.global_step % self.config.eval_steps == 0:
-                #     eval_metrics = self.evaluate()
-                #     logger.info(f"Step {self.global_step} - Eval MRR: {eval_metrics['mrr']:.4f}")
-                    
-                #     if eval_metrics['mrr'] > self.best_mrr:
-                #         self.best_mrr = eval_metrics['mrr']
-                #         self.save_checkpoint('best')
-                    
-                #     self.model.train()
-                
-                # # 保存检查点
-                # if self.global_step % self.config.save_steps == 0:
-                #     self.save_checkpoint(f'step_{self.global_step}')
         
         return {
             'loss': total_loss / num_batches,
             **{k: v / num_batches for k, v in total_metrics.items()}
         }
+        
     
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
@@ -494,12 +483,14 @@ class ContrastiveTrainer:
         recall_at_1 = np.mean(ranks <= 1)
         recall_at_5 = np.mean(ranks <= 5)
         recall_at_10 = np.mean(ranks <= 10)
+        recall_at_100 = np.mean(ranks <= 100)
         
         return {
             'mrr': mrr,
             'recall@1': recall_at_1,
             'recall@5': recall_at_5,
             'recall@10': recall_at_10,
+            'recall@100': recall_at_100,
             'mean_rank': np.mean(ranks)
         }
     
@@ -532,9 +523,11 @@ class ContrastiveTrainer:
         """完整训练流程"""
         logger.info("Starting training...")
         logger.info(f"Total epochs: {self.config.num_epochs}")
-        logger.info(f"Batch size: {self.config.batch_size}")
+        logger.info(f"Train batch size: {self.config.train_batch_size}")
         logger.info(f"Gradient accumulation steps: {self.config.gradient_accumulation_steps}")
-        logger.info(f"Effective batch size: {self.config.batch_size * self.config.gradient_accumulation_steps}")
+        logger.info(f"Effective batch size: {self.config.train_batch_size * self.config.gradient_accumulation_steps}")
+        logger.info(f"Eval batch size: {self.config.eval_batch_size}")
+        logger.info(f"Testing batch size: {self.config.eval_batch_size}")
         
         for epoch in range(self.config.num_epochs):
             train_metrics = self.train_epoch(epoch)
@@ -550,12 +543,97 @@ class ContrastiveTrainer:
                 logger.info(
                     f"Eval MRR: {eval_metrics['mrr']:.4f}, "
                     f"Recall@1: {eval_metrics['recall@1']:.4f}, "
-                    f"Recall@5: {eval_metrics['recall@5']:.4f}"
+                    f"Recall@5: {eval_metrics['recall@5']:.4f}, "
+                    f"Recall@10: {eval_metrics['recall@10']:.4f}, "
+                    f"Recall@100: {eval_metrics['recall@100']:.4f}, "
+                    f"Mean Rank: {eval_metrics['mean_rank']:.2f}"
                 )
         
         # 保存最终模型
         self.save_checkpoint('final')
         logger.info(f"Training completed. Best MRR: {self.best_mrr:.4f}")
+
+    @torch.no_grad()
+    def test(self) -> Dict[str, float]:
+        """测试模型，计算检索指标"""
+        self.model.eval()
+        recall = []
+        accuracy = []
+        precision = []
+        gt = []
+        avg = []
+
+        for batch in tqdm(self.test_dataloader, desc="Testing"):
+            asm_input_ids = batch['asm_input_ids'].to(self.device)
+            asm_attention_mask = batch['asm_attention_mask'].to(self.device)
+            source_input_ids = batch['source_input_ids'].to(self.device)
+            source_attention_mask = batch['source_attention_mask'].to(self.device)
+            labels = batch["label"].to(self.device)
+            
+            if self.config.fp16:
+                with torch.amp.autocast('cuda'):
+                    asm_embeddings, source_embeddings = self.model(
+                        asm_input_ids, asm_attention_mask,
+                        source_input_ids, source_attention_mask
+                    )
+            else:
+                asm_embeddings, source_embeddings = self.model(
+                    asm_input_ids, asm_attention_mask,
+                    source_input_ids, source_attention_mask
+                )
+            
+            ans = 0
+            for i in range(len(asm_embeddings)):
+                vA=torch.tensor(asm_embeddings[i]).cpu()
+                sim=[]
+                for j in range(len(source_embeddings)):
+                    vB=torch.tensor(source_embeddings[j]).cpu()
+                    AB_sim = F.cosine_similarity(vA, vB).item()
+                    sim.append(AB_sim)
+                sim=np.array(sim)
+                y=np.argsort(-sim)
+                posi = 0
+                for j in range(len(source_embeddings)):
+                    if y[j]==i:
+                        posi=j+1
+                        break
+                
+                gt.append(sim[i])
+
+                ans += 1/posi
+            ans = ans /len(asm_embeddings)
+            avg.append(ans)
+        
+            # L2归一化
+            asm_embeddings = F.normalize(asm_embeddings, p=2, dim=1)
+            source_embeddings = F.normalize(source_embeddings, p=2, dim=1)
+            
+            # 计算每对样本的相似度（点积，因为已经归一化所以等于余弦相似度）
+            # [batch_size]
+            pairwise_sim = (asm_embeddings * source_embeddings).sum(dim=1) / self.temperature
+            
+            # 分离正负样本
+            pos_mask = labels == 1
+            
+            num_pos = pos_mask.sum().item()
+            
+            # ============ 计算指标 ============
+            
+            # 计算准确率（使用0.5作为阈值）
+            threshold = 0.5 / self.temperature
+            predictions = (pairwise_sim > threshold).float()
+            batch_acc = (predictions == labels.float()).float().mean().item()
+            batch_recall = ((predictions == 1) & (labels == 1)).float().sum().item() / max(num_pos, 1)
+            batch_precision = ((predictions == 1) & (labels == 1)).float().sum().item() / max((predictions == 1).float().sum().item(), 1)
+            recall.append(batch_recall)
+            accuracy.append(batch_acc)
+            precision.append(batch_precision)
+        return {
+            'mrr': np.mean(np.array(avg)),
+            'accuracy': np.mean(np.array(accuracy)),
+            'recall': np.mean(np.array(recall)),
+            'precision': np.mean(np.array(precision))
+        }
 
 
 def setup_qlora_selective_training(model, num_layers_to_train=14):
@@ -590,8 +668,10 @@ def main():
     parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-Coder-7B-Instruct')
     parser.add_argument('--train_data', type=str, default='resources/datasets/train_dataset.csv')
     parser.add_argument('--val_data', type=str, default='resources/datasets/eval_dataset.csv')
-    parser.add_argument('--output_dir', type=str, default='resources/finetune_modules')
-    parser.add_argument('--batch_size', type=int, default=2)
+    parser.add_argument('--test_data', type=str, default='resources/datasets/test_dataset.csv')
+    parser.add_argument('--output_dir', type=str, default=f'resources/finetunemodules-{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+    parser.add_argument('--train_batch_size', type=int, default=8)
+    parser.add_argument('--eval_batch_size', type=int, default=32)
     parser.add_argument('--learning_rate', type=float, default=2e-5)
     parser.add_argument('--num_epochs', type=int, default=10)
     parser.add_argument('--temperature', type=float, default=0.05)
@@ -601,14 +681,22 @@ def main():
     
     args = parser.parse_args()
     
+    logger.info(f"model_name: {args.model_name}")
+    logger.info(f"output_dir: {args.output_dir}")
+    logger.info(f"learning_rate: {args.learning_rate}")
+    logger.info(f"temperature: {args.temperature}")
+    logger.info(f"max_seq_length: {args.max_seq_length}")
+    logger.info(f"fintune_layers: {args.fintune_layers}")
     
     # 配置
     config = TrainingConfig(
         model_name=args.model_name,
         train_data_path=args.train_data,
         val_data_path=args.val_data,
+        test_data_path=args.test_data,
         output_dir=args.output_dir,
-        batch_size=args.batch_size,
+        train_batch_size=args.train_batch_size,
+        eval_batch_size=args.train_batch_size,
         learning_rate=args.learning_rate,
         num_epochs=args.num_epochs,
         temperature=args.temperature,
@@ -633,7 +721,7 @@ def main():
     np.random.seed(config.seed)
     
     # 加载tokenizer
-    logger.info(f"Loading tokenizer: {config.model_name}")
+    logger.info(f"Loading tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(
         config.model_name,
         trust_remote_code=True
@@ -651,7 +739,7 @@ def main():
     print(f"✓ 使用 4-bit 量化 (NF4 + 双重量化)")
     
     # 加载模型
-    logger.info(f"Loading model: {config.model_name}")
+    logger.info(f"Loading model")
     base_model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
         quantization_config=quantization_config,
@@ -661,7 +749,7 @@ def main():
     )
     
     
-    logger.info(f"finetune last {config.fintune_layers} decoder layers")
+    logger.info(f"finetuning")
     lora_target_modules = setup_qlora_selective_training(base_model, config.fintune_layers)
     
     # 配置LoRA
@@ -701,6 +789,7 @@ def main():
         tokenizer=tokenizer,
         max_length=config.max_seq_length
     )
+    logger.info(f"训练集样本数: {len(train_dataset)}")
     
     val_dataset = None
     if os.path.exists(config.val_data_path):
@@ -709,10 +798,20 @@ def main():
             tokenizer=tokenizer,
             max_length=config.max_seq_length
         )
+    logger.info(f"验证集样本数: {len(val_dataset) if val_dataset else 0}")
+    
+    test_dataset = None
+    if os.path.exists(config.test_data_path):
+        test_dataset = BinarySourceDataset(
+            data_path=config.test_data_path,
+            tokenizer=tokenizer,
+            max_length=config.max_seq_length
+        )
+    logger.info(f"测试集样本数: {len(test_dataset) if test_dataset else 0}")
     
     train_dataloader = DataLoader(
         train_dataset,
-        batch_size=config.batch_size,
+        batch_size=config.train_batch_size,
         shuffle=True,
         num_workers=4,
         pin_memory=True
@@ -722,7 +821,17 @@ def main():
     if val_dataset:
         val_dataloader = DataLoader(
             val_dataset,
-            batch_size=config.batch_size,
+            batch_size=config.eval_batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
+    
+    test_dataloader = None
+    if test_dataset:
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=config.eval_batch_size,
             shuffle=False,
             num_workers=4,
             pin_memory=True
@@ -733,15 +842,25 @@ def main():
         model=contrastive_model,
         train_dataloader=train_dataloader,
         val_dataloader=val_dataloader,
+        test_dataloader=test_dataloader,
         config=config,
         device=device
     )
     
     trainer.train()
+
+    # 测试模型
+    if test_dataloader:
+        test_metrics = trainer.test()
+        logger.info(
+            f"Test MRR: {test_metrics['mrr']:.4f}, "
+            f"Accuracy: {test_metrics['accuracy']:.4f}, "
+            f"Recall: {test_metrics['recall']:.4f}, "
+            f"Precision: {test_metrics['precision']:.4f}"
+        )
     
     if config.use_wandb:
         wandb.finish()
-
 
 if __name__ == '__main__':
     main()

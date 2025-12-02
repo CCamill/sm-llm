@@ -1,7 +1,9 @@
-"""使用 Tree-sitter 的函数提取（C/C++）。
-
-依赖: tree_sitter (Python binding), 语言语法库 tree-sitter-c / tree-sitter-cpp
-enviorment: conda base
+"""
+C/C++ 函数信息提取器
+使用 tree-sitter 解析 C/C++ 源代码并提取函数信息
+tree_sitter_c: 0.24.1
+tree-sitter-cpp: 0.23.4
+tree-sitter: 0.25.2
 """
 
 import os

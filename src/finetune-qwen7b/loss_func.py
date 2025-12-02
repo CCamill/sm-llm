@@ -130,44 +130,16 @@ class LabeledContrastiveLoss(nn.Module):
         return total_loss, metrics
 
 
-class LabeledInfoNCELoss(nn.Module):
     """
-    基于显式标签的InfoNCE损失
-    
-    将batch中的正样本作为正样本对，负样本和其他样本作为负样本
-    这是一个更复杂的版本，利用batch内的所有样本
+    三元组损失：专门为混合正负样本的数据设计
     """
     
-    def __init__(
-        self,
-        temperature: float = 0.05,
-        hard_negative_weight: float = 1.0,
-        margin: float = 0.2,
-        use_in_batch_negatives: bool = True
-    ):
+    def __init__(self, margin: float = 0.2):
         super().__init__()
-        self.temperature = temperature
-        self.hard_negative_weight = hard_negative_weight
         self.margin = margin
-        self.use_in_batch_negatives = use_in_batch_negatives
+        self.triplet_loss = nn.TripletMarginLoss(margin=margin, p=2)
     
-    def forward(
-        self,
-        asm_embeddings: torch.Tensor,
-        source_embeddings: torch.Tensor,
-        labels: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        计算InfoNCE损失
-        
-        对于每个正样本对，将其与batch中所有其他source进行对比
-        显式的负样本（label=0）会被赋予更高的权重
-        
-        Args:
-            asm_embeddings: 汇编代码嵌入 [batch_size, embedding_dim]
-            source_embeddings: 源代码嵌入 [batch_size, embedding_dim]
-            labels: 标签 [batch_size]，1表示正样本对，0表示负样本对
-        """
+    def forward(self, asm_embeddings, source_embeddings, labels):
         batch_size = asm_embeddings.shape[0]
         device = asm_embeddings.device
         
@@ -175,119 +147,142 @@ class LabeledInfoNCELoss(nn.Module):
         asm_embeddings = F.normalize(asm_embeddings, p=2, dim=1)
         source_embeddings = F.normalize(source_embeddings, p=2, dim=1)
         
-        # 计算完整的相似度矩阵 [batch_size, batch_size]
-        # sim_matrix[i, j] = asm_i 与 source_j 的相似度
-        sim_matrix = torch.matmul(asm_embeddings, source_embeddings.T) / self.temperature
+        # 分离正负样本
+        pos_mask = (labels == 1)
+        neg_mask = (labels == 0)
         
-        # 获取正样本索引
-        pos_indices = torch.where(labels == 1)[0]
-        neg_indices = torch.where(labels == 0)[0]
+        pos_indices = torch.where(pos_mask)[0]
+        neg_indices = torch.where(neg_mask)[0]
         
-        num_pos = len(pos_indices)
-        num_neg = len(neg_indices)
+        if len(pos_indices) == 0 or len(neg_indices) == 0:
+            metrics = {'loss': 0.0, 'num_pos': len(pos_indices), 'num_neg': len(neg_indices)}
+            return torch.tensor(0.0, device=device), metrics
         
-        if num_pos == 0:
-            # 如果没有正样本，返回0损失
-            metrics = {
-                'accuracy': 0.0,
-                'mean_pos_sim': 0.0,
-                'mean_neg_sim': 0.0,
-                'num_pos': 0,
-                'num_neg': num_neg
-            }
-            return torch.tensor(0.0, device=device, requires_grad=True), metrics
+        total_loss = 0.0
+        num_triplets = 0
         
-        # ============ 计算InfoNCE损失 ============
-        
-        total_loss = torch.tensor(0.0, device=device)
-        
-        # 对每个正样本计算损失
-        pos_sims = []
-        neg_sims_list = []
-        
-        for idx in pos_indices:
-            idx = idx.item()
+        # 为每个正样本对构建三元组
+        for pos_idx in pos_indices:
+            anchor = asm_embeddings[pos_idx]      # 汇编代码
+            positive = source_embeddings[pos_idx] # 对应的源代码（正样本）
             
-            # 正样本相似度：asm[idx] 与其配对的 source[idx]
-            pos_sim = sim_matrix[idx, idx]
-            pos_sims.append(pos_sim)
-            
-            # 负样本相似度
-            if self.use_in_batch_negatives:
-                # 使用所有其他source作为负样本
-                neg_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
-                neg_mask[idx] = False  # 排除自己
-                neg_sim = sim_matrix[idx, neg_mask]
-            else:
-                # 只使用显式负样本
-                if num_neg > 0:
-                    neg_sim = sim_matrix[idx, neg_indices]
-                else:
-                    neg_sim = torch.tensor([], device=device)
-            
-            if len(neg_sim) > 0:
-                neg_sims_list.append(neg_sim)
+            # 随机选择一个负样本
+            if len(neg_indices) > 0:
+                neg_idx = neg_indices[torch.randint(0, len(neg_indices), (1,))]
+                negative = source_embeddings[neg_idx]
                 
-                # InfoNCE: -log(exp(pos) / (exp(pos) + sum(exp(neg))))
-                logits = torch.cat([pos_sim.unsqueeze(0), neg_sim])
-                target = torch.zeros(1, dtype=torch.long, device=device)
-                loss_i = F.cross_entropy(logits.unsqueeze(0), target)
-                total_loss = total_loss + loss_i
+                loss = self.triplet_loss(anchor.unsqueeze(0), positive.unsqueeze(0), negative.unsqueeze(0))
+                total_loss += loss
+                num_triplets += 1
         
-        # 平均损失
-        if num_pos > 0:
-            total_loss = total_loss / num_pos
+        if num_triplets > 0:
+            total_loss = total_loss / num_triplets
         
-        # ============ 困难负样本惩罚 ============
-        
-        if num_neg > 0 and self.hard_negative_weight > 0:
-            # 显式负样本的相似度
-            explicit_neg_sims = sim_matrix[neg_indices, neg_indices]  # 对角线上的负样本对
-            
-            # 找到最困难的负样本（相似度最高的）
-            hard_neg_sim = explicit_neg_sims.max()
-            
-            # 如果有正样本，添加margin惩罚
-            if num_pos > 0:
-                pos_sims_tensor = torch.stack(pos_sims)
-                avg_pos_sim = pos_sims_tensor.mean()
-                
-                # 惩罚：困难负样本不应该比平均正样本相似度更高
-                hard_neg_penalty = F.relu(hard_neg_sim - avg_pos_sim + self.margin)
-                total_loss = total_loss + self.hard_negative_weight * hard_neg_penalty
-        
-        # ============ 计算指标 ============
-        
+        # 计算指标
         with torch.no_grad():
+            pairwise_sim = (asm_embeddings * source_embeddings).sum(dim=1)
+            predictions = (pairwise_sim > 0).float()
+            accuracy = (predictions == labels.float()).float().mean().item()
+            
+            pos_sim = pairwise_sim[pos_mask].mean().item() if len(pos_mask) > 0 else 0.0
+            neg_sim = pairwise_sim[neg_mask].mean().item() if len(neg_mask) > 0 else 0.0
+            
             metrics = {
-                'num_pos': num_pos,
-                'num_neg': num_neg,
+                'loss': total_loss.item() if num_triplets > 0 else 0.0,
+                'accuracy': accuracy,
+                'num_pos': len(pos_indices),
+                'num_neg': len(neg_indices),
+                'mean_pos_sim': pos_sim,
+                'mean_neg_sim': neg_sim,
+                'sim_gap': pos_sim - neg_sim
             }
-            
-            if num_pos > 0:
-                pos_sims_tensor = torch.stack(pos_sims) * self.temperature
-                metrics['mean_pos_sim'] = pos_sims_tensor.mean().item()
-            else:
-                metrics['mean_pos_sim'] = 0.0
-            
-            if len(neg_sims_list) > 0:
-                all_neg_sims = torch.cat(neg_sims_list) * self.temperature
-                metrics['mean_neg_sim'] = all_neg_sims.mean().item()
-                metrics['hard_neg_sim'] = all_neg_sims.max().item()
-            else:
-                metrics['mean_neg_sim'] = 0.0
-                metrics['hard_neg_sim'] = 0.0
-            
-            # 正负样本分离度
-            metrics['sim_gap'] = metrics['mean_pos_sim'] - metrics['mean_neg_sim']
-            
-            # 简单准确率
-            pairwise_sim = torch.diagonal(sim_matrix) * self.temperature
-            predictions = (pairwise_sim > 0.5).float()
-            metrics['accuracy'] = (predictions == labels.float()).float().mean().item()
         
         return total_loss, metrics
 
+class PairwiseCosineLoss(nn.Module):
+    """
+    适用于二分类验证任务：
+    Label=1: 拉近 (maximize cosine similarity)
+    Label=0: 推远 (minimize cosine similarity, with margin)
+    """
+    def __init__(self, margin: float = 0.2):
+        super().__init__()
+        self.margin = margin
+        # PyTorch 自带的 CosineEmbeddingLoss
+        # target=1 表示相似，target=-1 表示不相似
+        self.loss_fn = nn.CosineEmbeddingLoss(margin=margin)
+
+    def forward(self, asm_embeddings, source_embeddings, labels):
+        # 转换标签：0/1 -> -1/1
+        # 假设输入 labels 是 0 和 1
+        targets = labels.clone().float()
+        targets[targets == 0] = -1  # 将 0 变为 -1
+        
+        loss = self.loss_fn(asm_embeddings, source_embeddings, targets)
+        
+        # 计算简单的二分类准确率（基于阈值）
+        with torch.no_grad():
+            cos_sim = F.cosine_similarity(asm_embeddings, source_embeddings)
+            # 简单的阈值判定，这里假设 > margin 是正样本（具体阈值需根据业务调整）
+            preds = (cos_sim > self.margin).long()
+            acc = (preds == labels).float().mean()
+            
+            metrics = {
+                'loss': loss.item(),
+                'accuracy': acc.item(),
+                'mean_pos_sim': cos_sim[labels==1].mean().item() if (labels==1).any() else 0,
+                'mean_neg_sim': cos_sim[labels==0].mean().item() if (labels==0).any() else 0
+            }
+            
+        return loss, metrics
+
+class VectorizedLabeledInfoNCELoss(nn.Module):
+    def __init__(self, temperature: float = 0.05):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, asm_embeddings, source_embeddings, labels):
+        batch_size = asm_embeddings.shape[0]
+        device = asm_embeddings.device
+
+        # 1. L2 归一化
+        asm_embeddings = F.normalize(asm_embeddings, p=2, dim=1)
+        source_embeddings = F.normalize(source_embeddings, p=2, dim=1)
+
+        # 2. 计算相似度矩阵 [batch_size, batch_size]
+        # sim_matrix[i][j] 表示 asm[i] 和 source[j] 的相似度
+        sim_matrix = torch.matmul(asm_embeddings, source_embeddings.T) / self.temperature
+
+        # 3. 构造 InfoNCE 的 Logits 和 Labels
+        # 对于 InfoNCE，asm[i] 的目标（正样本）应该是 source[i]
+        # 所以对于第 i 行，正确的类别索引就是 i
+        target_indices = torch.arange(batch_size, device=device)
+
+        # 4. 只选取 label=1 的样本计算 Loss
+        # 即使是 label=0 的样本，它们仍然作为 label=1 样本的分母（负样本）参与了计算，没有完全浪费
+        pos_mask = (labels == 1)
+        
+        if pos_mask.sum() == 0:
+            return torch.tensor(0.0, device=device), {}
+
+        # 5. 计算 CrossEntropy
+        # 我们只提取 pos_mask 为 True 的行来计算 Loss
+        loss = F.cross_entropy(sim_matrix[pos_mask], target_indices[pos_mask])
+
+        # --- 计算简单指标 ---
+        with torch.no_grad():
+            # 这里的准确率是指：在Batch内，每个asm能否正确检索到对应的source
+            preds = torch.argmax(sim_matrix, dim=1)
+            correct = (preds == target_indices) & pos_mask # 只看正样本对是否检索正确
+            acc = correct.sum() / pos_mask.sum()
+            
+            metrics = {
+                'loss': loss.item(),
+                'accuracy': acc.item(),
+                'num_pos_pairs': pos_mask.sum().item()
+            }
+
+        return loss, metrics
 
 class HardNegativeInfoNCELossWithLabels(nn.Module):
     """
@@ -597,8 +592,6 @@ class HardNegativeInfoNCELoss(nn.Module):
         
         return total_loss, metrics
 
-
-
 # ============ 简化版本：最推荐使用 ============
 
 class SimpleContrastiveLossWithLabels(nn.Module):
@@ -743,39 +736,3 @@ class SimpleContrastiveLossWithLabels(nn.Module):
                 metrics['pairwise_accuracy'] = correct_pairs.mean().item()
         
         return total_loss, metrics
-
-
-# ============ 使用示例 ============
-
-def example_usage():
-    """使用示例"""
-    
-    # 模拟数据
-    batch_size = 16
-    embedding_dim = 256
-    
-    # 假设batch中有10个正样本，6个负样本
-    asm_embeddings = torch.randn(batch_size, embedding_dim)
-    source_embeddings = torch.randn(batch_size, embedding_dim)
-    labels = torch.tensor([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0])
-    
-    # 创建损失函数
-    loss_fn = SimpleContrastiveLossWithLabels(
-        temperature=0.05,
-        margin=0.3,
-        lambda_pair=1.0,
-        lambda_infonce=1.0,
-        lambda_margin=0.5
-    )
-    
-    # 计算损失
-    loss, metrics = loss_fn(asm_embeddings, source_embeddings, labels)
-    
-    print(f"Loss: {loss.item():.4f}")
-    print(f"Metrics: {metrics}")
-    
-    return loss, metrics
-
-
-if __name__ == '__main__':
-    example_usage()
