@@ -16,6 +16,7 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from peft import PeftModel
 from torch.utils.data import Dataset, DataLoader
 from transformers import (
     AutoModelForCausalLM,
@@ -283,6 +284,20 @@ class ContrastiveTrainer:
         
         self.global_step = 0
         self.best_mrr = 0.0
+        self.best_epoch = 0
+    
+    def load_training_state(self, training_state):
+        """加载训练状态"""
+        if training_state is None:
+            return
+        self.best_mrr = training_state.get('best_mrr', 0.0)
+        self.global_step = training_state.get('global_step', 0)
+            
+        self.optimizer.load_state_dict(training_state['optimizer_state_dict'])
+        self.scheduler.load_state_dict(training_state['scheduler_state_dict'])
+        
+        
+        logger.info(f"恢复训练状态: global_step={self.global_step}, best_mrr={self.best_mrr:.4f}")
     
     def _create_optimizer(self):
         """创建优化器，对不同参数使用不同的学习率"""
@@ -519,7 +534,7 @@ class ContrastiveTrainer:
         
         logger.info(f"Checkpoint saved to {output_dir}")
     
-    def train(self):
+    def train(self, resume_from_checkpoint: Optional[Dict] = None, start_epoch: int = 0):
         """完整训练流程"""
         logger.info("Starting training...")
         logger.info(f"Total epochs: {self.config.num_epochs}")
@@ -529,7 +544,16 @@ class ContrastiveTrainer:
         logger.info(f"Eval batch size: {self.config.eval_batch_size}")
         logger.info(f"Testing batch size: {self.config.eval_batch_size}")
         
-        for epoch in range(self.config.num_epochs):
+        if resume_from_checkpoint is not None:
+            self.load_training_state(resume_from_checkpoint)
+        # 计算起始epoch（从global_step推断）
+        steps_per_epoch = len(self.train_dataloader) // self.config.gradient_accumulation_steps
+        if steps_per_epoch > 0:
+            start_epoch = self.global_step // steps_per_epoch
+        else:
+            start_epoch = 0
+        logger.info(f"从第 {start_epoch} 个epoch开始训练")
+        for epoch in range(start_epoch, self.config.num_epochs):
             train_metrics = self.train_epoch(epoch)
             logger.info(
                 f"Epoch {epoch + 1} completed. "
@@ -548,6 +572,13 @@ class ContrastiveTrainer:
                     f"Recall@100: {eval_metrics['recall@100']:.4f}, "
                     f"Mean Rank: {eval_metrics['mean_rank']:.2f}"
                 )
+            self.save_checkpoint(f'Epoch-{epoch}')
+            logger.info(f"Checkpoint for epoch {epoch} saved.")
+            if eval_metrics and eval_metrics.get('mrr', 0) > self.best_mrr:
+                self.best_epoch = epoch
+                self.best_mrr = eval_metrics['mrr']
+                self.save_checkpoint('best')
+                logger.info(f"New best MRR: {self.best_mrr:.4f}, checkpoint saved.")
         
         # 保存最终模型
         self.save_checkpoint('final')
@@ -555,85 +586,76 @@ class ContrastiveTrainer:
 
     @torch.no_grad()
     def test(self) -> Dict[str, float]:
-        """测试模型，计算检索指标"""
+        """高效批量计算版本的测试函数"""
         self.model.eval()
-        recall = []
-        accuracy = []
-        precision = []
-        gt = []
-        avg = []
-
-        for batch in tqdm(self.test_dataloader, desc="Testing"):
+        all_asm_embeddings = []
+        all_source_embeddings = []
+        
+        # 收集所有嵌入
+        for batch in tqdm(self.test_dataloader, desc="收集嵌入"):
             asm_input_ids = batch['asm_input_ids'].to(self.device)
             asm_attention_mask = batch['asm_attention_mask'].to(self.device)
             source_input_ids = batch['source_input_ids'].to(self.device)
             source_attention_mask = batch['source_attention_mask'].to(self.device)
-            labels = batch["label"].to(self.device)
             
-            if self.config.fp16:
-                with torch.amp.autocast('cuda'):
-                    asm_embeddings, source_embeddings = self.model(
-                        asm_input_ids, asm_attention_mask,
-                        source_input_ids, source_attention_mask
-                    )
-            else:
-                asm_embeddings, source_embeddings = self.model(
-                    asm_input_ids, asm_attention_mask,
-                    source_input_ids, source_attention_mask
-                )
+            with torch.no_grad():
+                if self.config.fp16:
+                    with torch.amp.autocast('cuda'):
+                        asm_emb = self.model.get_embedding(asm_input_ids, asm_attention_mask)
+                        source_emb = self.model.get_embedding(source_input_ids, source_attention_mask)
+                else:
+                    asm_emb = self.model.get_embedding(asm_input_ids, asm_attention_mask)
+                    source_emb = self.model.get_embedding(source_input_ids, source_attention_mask)
             
-            ans = 0
-            for i in range(len(asm_embeddings)):
-                vA=torch.tensor(asm_embeddings[i]).cpu()
-                sim=[]
-                for j in range(len(source_embeddings)):
-                    vB=torch.tensor(source_embeddings[j]).cpu()
-                    AB_sim = F.cosine_similarity(vA, vB).item()
-                    sim.append(AB_sim)
-                sim=np.array(sim)
-                y=np.argsort(-sim)
-                posi = 0
-                for j in range(len(source_embeddings)):
-                    if y[j]==i:
-                        posi=j+1
-                        break
-                
-                gt.append(sim[i])
-
-                ans += 1/posi
-            ans = ans /len(asm_embeddings)
-            avg.append(ans)
+            all_asm_embeddings.append(asm_emb.cpu())
+            all_source_embeddings.append(source_emb.cpu())
         
-            # L2归一化
-            asm_embeddings = F.normalize(asm_embeddings, p=2, dim=1)
-            source_embeddings = F.normalize(source_embeddings, p=2, dim=1)
-            
-            # 计算每对样本的相似度（点积，因为已经归一化所以等于余弦相似度）
-            # [batch_size]
-            pairwise_sim = (asm_embeddings * source_embeddings).sum(dim=1) / self.temperature
-            
-            # 分离正负样本
-            pos_mask = labels == 1
-            
-            num_pos = pos_mask.sum().item()
-            
-            # ============ 计算指标 ============
-            
-            # 计算准确率（使用0.5作为阈值）
-            threshold = 0.5 / self.temperature
-            predictions = (pairwise_sim > threshold).float()
-            batch_acc = (predictions == labels.float()).float().mean().item()
-            batch_recall = ((predictions == 1) & (labels == 1)).float().sum().item() / max(num_pos, 1)
-            batch_precision = ((predictions == 1) & (labels == 1)).float().sum().item() / max((predictions == 1).float().sum().item(), 1)
-            recall.append(batch_recall)
-            accuracy.append(batch_acc)
-            precision.append(batch_precision)
-        return {
-            'mrr': np.mean(np.array(avg)),
-            'accuracy': np.mean(np.array(accuracy)),
-            'recall': np.mean(np.array(recall)),
-            'precision': np.mean(np.array(precision))
+        # 合并所有嵌入
+        all_asm_embeddings = torch.cat(all_asm_embeddings, dim=0)
+        all_source_embeddings = torch.cat(all_source_embeddings, dim=0)
+        
+        # 确保是2D张量
+        if all_asm_embeddings.dim() == 1:
+            all_asm_embeddings = all_asm_embeddings.unsqueeze(0)
+        if all_source_embeddings.dim() == 1:
+            all_source_embeddings = all_source_embeddings.unsqueeze(0)
+        
+        # 计算相似度矩阵（批量计算，更高效）
+        all_asm_embeddings_norm = F.normalize(all_asm_embeddings, p=2, dim=1)
+        all_source_embeddings_norm = F.normalize(all_source_embeddings, p=2, dim=1)
+        similarity_matrix = torch.matmul(all_asm_embeddings_norm, all_source_embeddings_norm.T)
+        
+        # 计算排名
+        num_samples = similarity_matrix.size(0)
+        ranks = []
+        
+        for i in range(num_samples):
+            similarities = similarity_matrix[i]
+            sorted_indices = torch.argsort(similarities, descending=True)
+            rank = (sorted_indices == i).nonzero().item() + 1
+            ranks.append(rank)
+        
+        ranks = np.array(ranks)
+        
+        # 计算指标
+        metrics = {
+            'mrr': np.mean(1.0 / ranks),
+            'recall@1': np.mean(ranks <= 1),
+            'recall@5': np.mean(ranks <= 5),
+            'recall@10': np.mean(ranks <= 10),
+            'recall@100': np.mean(ranks <= 100),
+            'mean_rank': np.mean(ranks),
+            'num_samples': len(ranks)
         }
+        
+        logger.info(f"测试完成，样本数量: {metrics['num_samples']}")
+        logger.info(f"MRR: {metrics['mrr']:.4f}")
+        logger.info(f"Recall@1: {metrics['recall@1']:.4f}")
+        logger.info(f"Recall@5: {metrics['recall@5']:.4f}")
+        logger.info(f"Recall@10: {metrics['recall@10']:.4f}")
+        logger.info(f"Mean Rank: {metrics['mean_rank']:.2f}")
+        
+        return metrics
 
 
 def setup_qlora_selective_training(model, num_layers_to_train=14):
@@ -681,6 +703,8 @@ def main():
     
     args = parser.parse_args()
     
+    checkpoint_dir = "resources/finetunemodules-20251202_221448/Epoch-1"    # 可选：从该目录加载检查点
+    
     logger.info(f"model_name: {args.model_name}")
     logger.info(f"output_dir: {args.output_dir}")
     logger.info(f"learning_rate: {args.learning_rate}")
@@ -696,7 +720,7 @@ def main():
         test_data_path=args.test_data,
         output_dir=args.output_dir,
         train_batch_size=args.train_batch_size,
-        eval_batch_size=args.train_batch_size,
+        eval_batch_size=args.eval_batch_size,
         learning_rate=args.learning_rate,
         num_epochs=args.num_epochs,
         temperature=args.temperature,
@@ -748,22 +772,36 @@ def main():
         device_map='auto'
     )
     
-    
     logger.info(f"finetuning")
-    lora_target_modules = setup_qlora_selective_training(base_model, config.fintune_layers)
     
-    # 配置LoRA
-    logger.info("Configuring LoRA...")
-    lora_config = LoraConfig(
-        r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        target_modules=lora_target_modules,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM
-    )
+    if checkpoint_dir and os.path.exists(checkpoint_dir):
+        logger.info(f"从检查点加载模型: {checkpoint_dir}")
+        
+        # 直接从检查点加载LoRA权重，而不是先创建新的配置
+        lora_weights_path = os.path.join(checkpoint_dir, "lora_weights")
+        # 使用PeftModel.from_pretrained直接加载适配器
+        base_model = PeftModel.from_pretrained(
+            base_model, 
+            lora_weights_path,
+            is_trainable=True  # 确保适配器是可训练的
+        )
+        logger.info("✓ LoRA权重加载成功")
+    else:
+        # 没有检查点，创建新的适配器
+        # 配置LoRA
+        logger.info("Configuring LoRA...")
+        lora_target_modules = setup_qlora_selective_training(base_model, config.fintune_layers)
+        lora_config = LoraConfig(
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            target_modules=lora_target_modules,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM
+        )
+        base_model = get_peft_model(base_model, lora_config)
+        logger.info("创建新的LoRA适配器")
     
-    base_model = get_peft_model(base_model, lora_config)
     base_model.print_trainable_parameters(logger)
     
     compute_dtype = quantization_config.bnb_4bit_compute_dtype
@@ -777,11 +815,33 @@ def main():
         dropout=config.lora_dropout
     )
     contrastive_model = contrastive_model.to(device)
+    
     if contrastive_model.use_projection_head:
         # 将 ProjectionHead 的参数和 buffer 转换为 compute_dtype
         contrastive_model.projection_head.to(compute_dtype)
         logger.info(f"ProjectionHead successfully set to dtype: {compute_dtype}")
     
+    
+    training_state = None
+    if checkpoint_dir:
+        logger.info(f"Loading checkpoint from: {checkpoint_dir}")
+
+        # 加载projection head权重
+        projection_head_path = os.path.join(checkpoint_dir, "projection_head.pt")
+        if os.path.exists(projection_head_path) and contrastive_model.use_projection_head:
+            projection_head_state_dict = torch.load(projection_head_path, map_location=device)
+            contrastive_model.projection_head.load_state_dict(projection_head_state_dict)
+            logger.info("✓ Projection head权重加载成功")
+
+        # 加载训练状态（优化器、学习率调度器等）
+        training_state_path = os.path.join(checkpoint_dir, "training_state.pt")
+        if os.path.exists(training_state_path):
+            training_state = torch.load(training_state_path, map_location=device, weights_only=False)
+            logger.info("✓ 训练状态加载成功")
+        else:
+            training_state = None
+            logger.info("未找到训练状态文件，将重新初始化训练状态")
+
     # 创建数据集和数据加载器
     logger.info("Loading datasets...")
     train_dataset = BinarySourceDataset(
@@ -847,7 +907,7 @@ def main():
         device=device
     )
     
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_state)
 
     # 测试模型
     if test_dataloader:
