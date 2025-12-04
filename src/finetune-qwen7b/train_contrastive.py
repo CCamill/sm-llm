@@ -38,7 +38,7 @@ import pandas as pd
 import time
 from datetime import datetime
 
-from loss_func import HardNegativeInfoNCELossWithLabels, LabeledContrastiveLoss, VectorizedLabeledInfoNCELoss, PairwiseCosineLoss
+from loss_func import HardNegativeInfoNCELossWithLabels, LabeledContrastiveLoss, VectorizedLabeledInfoNCELoss, PairwiseCosineLoss, HardNegativeInfoNCELoss
 from playdata import BinarySourceDataset
 
 
@@ -265,8 +265,8 @@ class ContrastiveTrainer:
         self.device = device
         
         # 损失函数
-        self.loss_fn = PairwiseCosineLoss()
-        
+        self.loss_fn = HardNegativeInfoNCELoss()
+        logger.info(f"Using loss function: {self.loss_fn.__class__.__name__}")
         # 优化器
         self.optimizer = self._create_optimizer()
         
@@ -342,7 +342,6 @@ class ContrastiveTrainer:
             asm_attention_mask = batch['asm_attention_mask'].to(self.device)
             source_input_ids = batch['source_input_ids'].to(self.device)
             source_attention_mask = batch['source_attention_mask'].to(self.device)
-            labels = batch["label"].to(self.device)
             
             # 混合精度训练
             if self.config.fp16:
@@ -351,7 +350,7 @@ class ContrastiveTrainer:
                         asm_input_ids, asm_attention_mask,
                         source_input_ids, source_attention_mask
                     )
-                    loss, metrics = self.loss_fn(asm_emb, source_emb, labels)
+                    loss, metrics = self.loss_fn(asm_emb, source_emb)
                     loss = loss / self.config.gradient_accumulation_steps
                 
                 self.scaler.scale(loss).backward()
@@ -360,7 +359,7 @@ class ContrastiveTrainer:
                     asm_input_ids, asm_attention_mask,
                     source_input_ids, source_attention_mask
                 )
-                loss, metrics = self.loss_fn(asm_emb, source_emb, labels)
+                loss, metrics = self.loss_fn(asm_emb, source_emb)
                 loss = loss / self.config.gradient_accumulation_steps
                 loss.backward()
             
@@ -688,9 +687,9 @@ def setup_qlora_selective_training(model, num_layers_to_train=14):
 def main():
     parser = argparse.ArgumentParser(description='Contrastive Learning for Binary-Source Similarity')
     parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-Coder-7B-Instruct')
-    parser.add_argument('--train_data', type=str, default='resources/datasets/train_dataset.csv')
-    parser.add_argument('--val_data', type=str, default='resources/datasets/eval_dataset.csv')
-    parser.add_argument('--test_data', type=str, default='resources/datasets/test_dataset.csv')
+    parser.add_argument('--train_data', type=str, default='resources/datasets/dataset_train_no_label.csv')
+    parser.add_argument('--val_data', type=str, default='resources/datasets/dataset_eval_no_label.csv')
+    parser.add_argument('--test_data', type=str, default='resources/datasets/dataset_test_no_label.csv')
     parser.add_argument('--output_dir', type=str, default=f'resources/finetunemodules-{datetime.now().strftime("%Y%m%d_%H%M%S")}')
     parser.add_argument('--train_batch_size', type=int, default=8)
     parser.add_argument('--eval_batch_size', type=int, default=32)
@@ -700,10 +699,15 @@ def main():
     parser.add_argument('--max_seq_length', type=int, default=512)
     parser.add_argument('--use_wandb', action='store_true')
     parser.add_argument('--fintune_layers', type=int, default=4)
+    parser.add_argument('--checkpoint_dir', type=str, default=None, help='Path to load checkpoint from example: resources/finetune_modules/Epoch-3')
     
     args = parser.parse_args()
     
-    checkpoint_dir = "resources/finetunemodules-20251202_221448/Epoch-1"    # 可选：从该目录加载检查点
+    checkpoint_dir = args.checkpoint_dir
+    if not checkpoint_dir:
+        logger.info("!!!No checkpoint directory provided, starting training from scratch!!!")
+    else:
+        args.output_dir = checkpoint_dir.split("/")[-2]
     
     logger.info(f"model_name: {args.model_name}")
     logger.info(f"output_dir: {args.output_dir}")

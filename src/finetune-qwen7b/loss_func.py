@@ -570,10 +570,16 @@ class HardNegativeInfoNCELoss(nn.Module):
         # 计算损失
         # 基础InfoNCE损失
         labels = torch.arange(batch_size, device=asm_embeddings.device)
-        loss_basic = F.cross_entropy(sim_matrix, labels)
+        
+        # 计算双向
+        # 正向
+        loss_a2s = F.cross_entropy(sim_matrix, labels)
+        # 反向
+        loss_s2a = F.cross_entropy(sim_matrix.T, labels)
+        loss_basic = (loss_a2s + loss_s2a) / 2
         
         # 困难负样本惩罚：确保正样本比困难负样本高出margin
-        hard_neg_penalty = F.relu(hard_neg_sim - pos_sim + self.margin).mean()
+        hard_neg_penalty = F.relu(hard_neg_sim - pos_sim + self.margin / self.temperature).mean()
         
         total_loss = loss_basic + self.hard_negative_weight * hard_neg_penalty
         

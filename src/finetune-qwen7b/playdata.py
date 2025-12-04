@@ -7,16 +7,6 @@ import random
 class BinarySourceDataset(Dataset):
     r"""
     二进制-源码配对数据集
-    
-    数据格式示例:
-                                                    asm_func                                           src_func  label
-    0  0x5690 endbr64 | 0x5694 push    r15 | 0x5696 m...  static int updateMapping(\n  Rtree *pRtree, \n...      0
-    1  0x5c20 push    r12 | 0x5c22 mov     r12, rdx |...  static int fts3ShadowName(const char *zName){\...      0
-    2             0x690 endbr64 | 0x694 jmp     gzseek64  z_off_t ZEXPORT gzseek(gzFile file, z_off_t of...      1
-    3  0x4790 endbr64 | 0x4794 push    r15 | 0x4796 p...  int lsmFsIntegrityCheck(lsm_db *pDb){\n  Check...      1
-    4  0x840 endbr64 | 0x844 sub     rsp, 18h | 0x848...  void gh_heap_verify(gh_heap_t *heap) {\n  gh_h...      0
-
-
     """
     
     def __init__(
@@ -54,7 +44,6 @@ class BinarySourceDataset(Dataset):
         # 构建输入文本
         asm_text = self.asm_prompt_template.format(code=item['asm_func'])
         source_text = self.source_prompt_template.format(code=item['src_func'])
-        label = item['label']
         
         # Tokenize
         asm_encoding = self.tokenizer(
@@ -78,7 +67,6 @@ class BinarySourceDataset(Dataset):
             'asm_attention_mask': asm_encoding['attention_mask'].squeeze(0),
             'source_input_ids': source_encoding['input_ids'].squeeze(0),
             'source_attention_mask': source_encoding['attention_mask'].squeeze(0),
-            'label': label
         }
     
 

@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 if __name__ == "__main__":
     ida_df = pd.read_csv("resources/datasets/ida_funcs_deduplicated.csv")
-    src_df = pd.read_csv("resources/datasets/source_funcs_treesitter/src_funcs_deduplicated.csv")
+    src_df = pd.read_csv("resources/datasets/src_funcs_deduplicated.csv")
     ida_keys = set(ida_df['key'].tolist())
     src_keys = set(src_df['key'].tolist())
     common_keys = ida_keys.intersection(src_keys)
@@ -21,6 +21,7 @@ if __name__ == "__main__":
         ida_func_items = ida_df[ida_df['key'] == key]    # 同一个函数有不同优化级别的版本
         src_func_item = src_df[src_df['key'] == key]
         asm_funcs = ida_func_items['assembly_code'].values
+        optis = ida_func_items['opti_level'].values
         src_func = src_func_item['source_code'].values[0]
         if len(ida_func_items) > 1:
             pass
@@ -30,7 +31,8 @@ if __name__ == "__main__":
                 "key": key,
                 "func_name": func_name,
                 "asm_func": asm_func,
-                "src_func": src_func
+                "src_func": src_func,
+                "opti": optis[i]
             })
 
     print("total pairs: ", len(all_data))

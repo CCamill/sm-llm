@@ -20,7 +20,7 @@ def setup_logging(log_prefix: str = "") -> logging.Logger:
     """
     # 生成日志文件名（包含当前时间）
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(r"resources/logs", f"{current_time}_{log_prefix}.log")
+    log_file = os.path.join(r"resources/logs", f"{log_prefix}_{current_time}.log")
     
     # 配置日志格式
     logging.basicConfig(
@@ -36,7 +36,7 @@ def setup_logging(log_prefix: str = "") -> logging.Logger:
     logger.info(f"日志系统初始化完成，日志文件: {log_file}")
     return logger
 
-logger = setup_logging("build_train_eval_test_dataset")
+logger = setup_logging("split_dataset_with_label")
 
 
 def build_datasets(pos_df, out_path):
@@ -139,8 +139,8 @@ def main(dataset_path, train_dataset_path, eval_dataset_path, test_dataset_path)
 
 if __name__ == "__main__":
     dataset_path = 'resources/datasets/dataset.csv'
-    train_dataset_path = 'resources/datasets/train_dataset.csv'
-    eval_dataset_path = 'resources/datasets/eval_dataset.csv'
-    test_dataset_path = 'resources/datasets/test_dataset.csv'
+    train_dataset_path = 'resources/datasets/dataset_train_with_label.csv'
+    eval_dataset_path = 'resources/datasets/dataset_eval_with_label.csv'
+    test_dataset_path = 'resources/datasets/dataset_test_with_label.csv'
     # 执行函数
     main(dataset_path, train_dataset_path, eval_dataset_path, test_dataset_path)
