@@ -38,7 +38,7 @@ import pandas as pd
 import time
 from datetime import datetime
 
-from loss_func import HardNegativeInfoNCELossWithLabels, LabeledContrastiveLoss, VectorizedLabeledInfoNCELoss, PairwiseCosineLoss, HardNegativeInfoNCELoss
+from loss_func import HardNegativeInfoNCELoss
 from playdata import BinarySourceDataset
 
 
@@ -86,9 +86,10 @@ class TrainingConfig:
     
     # 对比学习配置
     temperature: float = 0.05  # InfoNCE温度参数
-    embedding_dim: int = 256   # 投影后的嵌入维度
+    embedding_dim: int = 512   # 投影后的嵌入维度
     use_projection_head: bool = True  # 是否使用投影头
     hard_negative_weight: float = 1.0  # 困难负样本权重
+    pooling_strategy: str = 'mean'  # 池化策略：'last_token', 'mean', 'cls'
     
     # 数据配置
     max_seq_length: int = 512
@@ -118,7 +119,7 @@ class ProjectionHead(nn.Module):
         self,
         hidden_size: int,
         projection_dim: int = 256,
-        dropout: float = 0.1
+        dropout: float = 0.2
     ):
         super().__init__()
         self.projection = nn.Sequential(
@@ -229,7 +230,7 @@ class ContrastiveModel(nn.Module):
         asm_attention_mask: torch.Tensor,
         source_input_ids: torch.Tensor,
         source_attention_mask: torch.Tensor,
-        pooling_strategy: str = 'last_token'
+        pooling_strategy: str = 'mean'
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播，获取汇编和源码的嵌入
@@ -333,7 +334,7 @@ class ContrastiveTrainer:
             ncols=150,
             leave=True
         )
-        
+        temperature = max(0.02, 0.05 * (1 - epoch / self.config.num_epochs))
         self.optimizer.zero_grad()
         
         for step, batch in progress_bar:
@@ -342,24 +343,25 @@ class ContrastiveTrainer:
             asm_attention_mask = batch['asm_attention_mask'].to(self.device)
             source_input_ids = batch['source_input_ids'].to(self.device)
             source_attention_mask = batch['source_attention_mask'].to(self.device)
-            
             # 混合精度训练
             if self.config.fp16:
                 with torch.amp.autocast('cuda'):
                     asm_emb, source_emb = self.model(
                         asm_input_ids, asm_attention_mask,
-                        source_input_ids, source_attention_mask
+                        source_input_ids, source_attention_mask,
+                        self.config.pooling_strategy
                     )
-                    loss, metrics = self.loss_fn(asm_emb, source_emb)
+                    loss, metrics = self.loss_fn(asm_emb, source_emb, temperature)
                     loss = loss / self.config.gradient_accumulation_steps
                 
                 self.scaler.scale(loss).backward()
             else:
                 asm_emb, source_emb = self.model(
                     asm_input_ids, asm_attention_mask,
-                    source_input_ids, source_attention_mask
+                    source_input_ids, source_attention_mask,
+                    self.config.pooling_strategy
                 )
-                loss, metrics = self.loss_fn(asm_emb, source_emb)
+                loss, metrics = self.loss_fn(asm_emb, source_emb, temperature)
                 loss = loss / self.config.gradient_accumulation_steps
                 loss.backward()
             
@@ -557,7 +559,9 @@ class ContrastiveTrainer:
             logger.info(
                 f"Epoch {epoch + 1} completed. "
                 f"Loss: {train_metrics['loss']:.4f}, "
-                f"Accuracy: {train_metrics['accuracy']:.4f}"
+                f"R@1 Accuracy: {train_metrics['accuracy']:.4f}, "
+                f"Mean Pos Sim: {train_metrics['mean_pos_sim']:.4f}, "
+                f"Mean Neg Sim: {train_metrics['mean_neg_sim']:.4f}"
             )
             
             # 每个epoch结束时评估
@@ -686,7 +690,7 @@ def setup_qlora_selective_training(model, num_layers_to_train=14):
 
 def main():
     parser = argparse.ArgumentParser(description='Contrastive Learning for Binary-Source Similarity')
-    parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-Coder-7B-Instruct')
+    parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-Coder-3B-Instruct', choices=["Qwen/Qwen2.5-Coder-3B-Instruct", "Qwen/Qwen2.5-Coder-7B-Instruct"])
     parser.add_argument('--train_data', type=str, default='resources/datasets/dataset_train_no_label.csv')
     parser.add_argument('--val_data', type=str, default='resources/datasets/dataset_eval_no_label.csv')
     parser.add_argument('--test_data', type=str, default='resources/datasets/dataset_test_no_label.csv')
@@ -694,11 +698,12 @@ def main():
     parser.add_argument('--train_batch_size', type=int, default=8)
     parser.add_argument('--eval_batch_size', type=int, default=32)
     parser.add_argument('--learning_rate', type=float, default=2e-5)
-    parser.add_argument('--num_epochs', type=int, default=10)
+    parser.add_argument('--num_epochs', type=int, default=20)
     parser.add_argument('--temperature', type=float, default=0.05)
     parser.add_argument('--max_seq_length', type=int, default=512)
     parser.add_argument('--use_wandb', action='store_true')
-    parser.add_argument('--fintune_layers', type=int, default=4)
+    parser.add_argument('--fintune_layers', type=int, default=8)
+    parser.add_argument('--pooling_strategy', type=str, default='mean', choices=['last_token', 'mean', 'eos'])
     parser.add_argument('--checkpoint_dir', type=str, default=None, help='Path to load checkpoint from example: resources/finetune_modules/Epoch-3')
     
     args = parser.parse_args()
@@ -711,10 +716,10 @@ def main():
     
     logger.info(f"model_name: {args.model_name}")
     logger.info(f"output_dir: {args.output_dir}")
-    logger.info(f"learning_rate: {args.learning_rate}")
-    logger.info(f"temperature: {args.temperature}")
     logger.info(f"max_seq_length: {args.max_seq_length}")
     logger.info(f"fintune_layers: {args.fintune_layers}")
+    logger.info(f"pooling_strategy: {args.pooling_strategy}")
+    
     
     # 配置
     config = TrainingConfig(
@@ -730,9 +735,12 @@ def main():
         temperature=args.temperature,
         max_seq_length=args.max_seq_length,
         use_wandb=args.use_wandb,
-        fintune_layers = args.fintune_layers
+        fintune_layers = args.fintune_layers,
+        pooling_strategy = args.pooling_strategy
     )
     
+    
+    logger.info(f"投影后的嵌入维度: {config.embedding_dim}")
     # 初始化wandb
     if config.use_wandb:
         wandb.init(
@@ -816,7 +824,7 @@ def main():
         hidden_size=hidden_size,
         projection_dim=config.embedding_dim,
         use_projection_head=config.use_projection_head,
-        dropout=config.lora_dropout
+        dropout=config.lora_dropout,
     )
     contrastive_model = contrastive_model.to(device)
     

@@ -540,7 +540,8 @@ class HardNegativeInfoNCELoss(nn.Module):
     def forward(
         self,
         asm_embeddings: torch.Tensor,
-        source_embeddings: torch.Tensor
+        source_embeddings: torch.Tensor,
+        temperature: float
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         计算带困难负样本的InfoNCE损失
@@ -552,7 +553,7 @@ class HardNegativeInfoNCELoss(nn.Module):
         source_embeddings = F.normalize(source_embeddings, p=2, dim=1)
         
         # 计算相似度矩阵
-        sim_matrix = torch.matmul(asm_embeddings, source_embeddings.T) / self.temperature
+        sim_matrix = torch.matmul(asm_embeddings, source_embeddings.T) / temperature
         
         # 正样本掩码（对角线）
         pos_mask = torch.eye(batch_size, device=asm_embeddings.device).bool()
@@ -579,15 +580,15 @@ class HardNegativeInfoNCELoss(nn.Module):
         loss_basic = (loss_a2s + loss_s2a) / 2
         
         # 困难负样本惩罚：确保正样本比困难负样本高出margin
-        hard_neg_penalty = F.relu(hard_neg_sim - pos_sim + self.margin / self.temperature).mean()
+        hard_neg_penalty = F.relu(hard_neg_sim - pos_sim + self.margin / temperature).mean()
         
         total_loss = loss_basic + self.hard_negative_weight * hard_neg_penalty
         
         # 计算一些指标
         with torch.no_grad():
             accuracy = (sim_matrix.argmax(dim=1) == labels).float().mean().item()
-            mean_pos_sim = pos_sim.mean().item() * self.temperature
-            mean_neg_sim = neg_sim.mean().item() * self.temperature
+            mean_pos_sim = pos_sim.mean().item() * temperature
+            mean_neg_sim = neg_sim.mean().item() * temperature
         
         metrics = {
             'accuracy': accuracy,
