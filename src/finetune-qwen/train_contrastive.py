@@ -431,17 +431,10 @@ class ContrastiveTrainer:
             source_input_ids = batch['source_input_ids'].to(self.device)
             source_attention_mask = batch['source_attention_mask'].to(self.device)
             
-            if self.config.fp16:
-                with torch.amp.autocast('cuda'):
-                    asm_emb, source_emb = self.model(
-                        asm_input_ids, asm_attention_mask,
-                        source_input_ids, source_attention_mask
-                    )
-            else:
-                asm_emb, source_emb = self.model(
-                    asm_input_ids, asm_attention_mask,
-                    source_input_ids, source_attention_mask
-                )
+            asm_emb, source_emb = self.model(
+                asm_input_ids, asm_attention_mask,
+                source_input_ids, source_attention_mask
+            )
             
             all_asm_embeddings.append(asm_emb.cpu())
             all_source_embeddings.append(source_emb.cpu())
