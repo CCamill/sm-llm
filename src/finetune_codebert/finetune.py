@@ -3,6 +3,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from dataload import FunctionSliceDataset
 from transformers import AutoTokenizer, AutoModelForMaskedLM, Trainer, TrainingArguments
 from transformers import DataCollatorForLanguageModeling
+import argparse
 
 class Fintune():
     def __init__(self, train_dataloader, val_dataloader):
@@ -14,6 +15,8 @@ class Fintune():
     def train(self):
         
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="contrastive train for calp and codebert")
+    parser.add_argument("--asm_model_name", type=str, default="hustcw/clap-asm")
     data = FunctionSliceDataset(root_dir='resources/datasets/source_funcs_treesitter')
     train_size = int(0.8*len(data))
     val_size = len(data) - train_size

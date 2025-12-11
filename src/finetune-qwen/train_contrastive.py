@@ -10,7 +10,7 @@ Binary-to-Source Code Contrastive Learning Fine-tuning
 3. 负样本：batch内其他不相关的函数对
 4. 使用LoRA进行参数高效微调
 """
-
+import sys
 import os
 import json
 import torch
@@ -38,26 +38,40 @@ import pandas as pd
 import time
 from datetime import datetime
 
+sys.path.insert(0, "/home/lab314/cjw/sm_llm")
 from loss_func import HardNegativeInfoNCELoss
 from playdata import BinarySourceDataset
+from model import ProjectionHead, ContrastiveModel
+from utils import setup_logging
+
+logger = setup_logging('qwen-finetune')
 
 
-def setup_logger(name: str, log_path: str) -> logging.Logger:
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-    fh = logging.FileHandler(log_path)
-    fh.setLevel(logging.DEBUG)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-    return logger
-
-logger = setup_logger(name = 'finetune', log_path=f"resources/logs/Qwen-Finetune-{time.time()}.log")
-
+def setup_qlora_selective_training(model, num_layers_to_train=14):
+    """
+    为QLoRA设置选择性训练，只训练最后N层
+    """
+    total_layers = len(model.model.layers)
+    start_layer = total_layers - num_layers_to_train
+    
+    print(f"总层数: {total_layers}, 训练层: {start_layer}到{total_layers-1}")
+    
+    # 构建目标模块列表，只包含最后14层的模块
+    target_modules = []
+    for layer_idx in range(start_layer, total_layers):
+        # 添加该层的所有目标模块
+        layer_prefix = f"model.layers.{layer_idx}."
+        target_modules.extend([
+            f"{layer_prefix}self_attn.q_proj",
+            f"{layer_prefix}self_attn.k_proj", 
+            f"{layer_prefix}self_attn.v_proj",
+            f"{layer_prefix}self_attn.o_proj",
+            f"{layer_prefix}mlp.gate_proj",
+            f"{layer_prefix}mlp.up_proj",
+            f"{layer_prefix}mlp.down_proj"
+        ])
+    
+    return target_modules
 
 @dataclass
 class TrainingConfig:
@@ -106,142 +120,6 @@ class TrainingConfig:
     fp16: bool = False  # 是否混合精度
     use_wandb: bool = False
     fintune_layers: int = 4
-
-
-class ProjectionHead(nn.Module):
-    """
-    投影头：将隐藏状态映射到对比学习的嵌入空间
-    
-    使用MLP结构可以学习更好的表示，避免直接使用隐藏状态
-    """
-    
-    def __init__(
-        self,
-        hidden_size: int,
-        projection_dim: int = 256,
-        dropout: float = 0.2
-    ):
-        super().__init__()
-        self.projection = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, projection_dim),
-            nn.LayerNorm(projection_dim)
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.projection(x)
-
-
-class ContrastiveModel(nn.Module):
-    """
-    对比学习模型封装
-    
-    包含：
-    1. 基座语言模型（Qwen2.5-Coder）
-    2. 投影头（可选）
-    """
-    
-    def __init__(
-        self,
-        model,
-        hidden_size: int,
-        projection_dim: int = 256,
-        use_projection_head: bool = True,
-        dropout: float = 0.1
-    ):
-        super().__init__()
-        self.model = model
-        self.use_projection_head = use_projection_head
-        
-        if use_projection_head:
-            self.projection_head = ProjectionHead(
-                hidden_size=hidden_size,
-                projection_dim=projection_dim,
-                dropout=dropout
-            )
-        else:
-            self.projection_head = None
-    
-    def get_embedding(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        pooling_strategy: str = 'mean'
-    ) -> torch.Tensor:
-        """
-        获取序列的嵌入表示
-        
-        Args:
-            input_ids: 输入token IDs
-            attention_mask: 注意力掩码
-            pooling_strategy: 池化策略 ('last_token', 'mean', 'cls')
-        
-        Returns:
-            embeddings: 嵌入表示
-        """
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            return_dict=True
-        )
-        
-        # 获取最后一层隐藏状态
-        hidden_states = outputs.hidden_states[-1]  # [batch_size, seq_len, hidden_size]
-        
-        if pooling_strategy == 'last_token':
-            # 使用最后一个非padding token的隐藏状态
-            # 找到每个序列的最后一个非padding位置
-            seq_lengths = attention_mask.sum(dim=1) - 1
-            batch_size = hidden_states.shape[0]
-            embeddings = hidden_states[
-                torch.arange(batch_size, device=hidden_states.device),
-                seq_lengths
-            ]
-        elif pooling_strategy == 'mean':
-            # 使用所有非padding token的平均值
-            mask = attention_mask.unsqueeze(-1).float()
-            sum_embeddings = (hidden_states * mask).sum(dim=1)
-            count = mask.sum(dim=1)
-            embeddings = sum_embeddings / count
-        elif pooling_strategy == 'eos':
-            # 使用EOS token的隐藏状态（与last_token类似但更明确）
-            seq_lengths = attention_mask.sum(dim=1) - 1
-            batch_size = hidden_states.shape[0]
-            embeddings = hidden_states[
-                torch.arange(batch_size, device=hidden_states.device),
-                seq_lengths
-            ]
-        else:
-            raise ValueError(f"Unknown pooling strategy: {pooling_strategy}")
-        
-        # 通过投影头
-        if self.use_projection_head and self.projection_head is not None:
-            embeddings = embeddings.to(self.projection_head.projection[0].weight.dtype)
-            embeddings = self.projection_head(embeddings)
-        
-        return embeddings
-    
-    def forward(
-        self,
-        asm_input_ids: torch.Tensor,
-        asm_attention_mask: torch.Tensor,
-        source_input_ids: torch.Tensor,
-        source_attention_mask: torch.Tensor,
-        pooling_strategy: str = 'mean'
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        前向传播，获取汇编和源码的嵌入
-        """
-        asm_embeddings = self.get_embedding(
-            asm_input_ids, asm_attention_mask, pooling_strategy
-        )
-        source_embeddings = self.get_embedding(
-            source_input_ids, source_attention_mask, pooling_strategy
-        )
-        return asm_embeddings, source_embeddings
 
 
 class ContrastiveTrainer:
@@ -526,7 +404,6 @@ class ContrastiveTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
         }, output_dir / 'training_state.pt')
         
-        logger.info(f"Checkpoint saved to {output_dir}")
     
     def train(self, resume_from_checkpoint: Optional[Dict] = None, start_epoch: int = 0):
         """完整训练流程"""
@@ -547,12 +424,12 @@ class ContrastiveTrainer:
         else:
             start_epoch = 0
         logger.info(f"从第 {start_epoch} 个epoch开始训练")
-        for epoch in range(start_epoch, self.config.num_epochs):
+        for epoch in range(start_epoch, start_epoch + self.config.num_epochs):
             train_metrics = self.train_epoch(epoch)
+            logger.info("--------------------------------------------------------------")
             logger.info(
-                f"Epoch {epoch + 1} completed. "
+                f"Epoch {epoch} completed. "
                 f"Loss: {train_metrics['loss']:.4f}, "
-                f"R@1 Accuracy: {train_metrics['accuracy']:.4f}, "
                 f"Mean Pos Sim: {train_metrics['mean_pos_sim']:.4f}, "
                 f"Mean Neg Sim: {train_metrics['mean_neg_sim']:.4f}"
             )
@@ -569,7 +446,6 @@ class ContrastiveTrainer:
                     f"Mean Rank: {eval_metrics['mean_rank']:.2f}"
                 )
             self.save_checkpoint(f'Epoch-{epoch}')
-            logger.info(f"Checkpoint for epoch {epoch} saved.")
             if eval_metrics and eval_metrics.get('mrr', 0) > self.best_mrr:
                 self.best_epoch = epoch
                 self.best_mrr = eval_metrics['mrr']
@@ -654,48 +530,24 @@ class ContrastiveTrainer:
         return metrics
 
 
-def setup_qlora_selective_training(model, num_layers_to_train=14):
-    """
-    为QLoRA设置选择性训练，只训练最后N层
-    """
-    total_layers = len(model.model.layers)
-    start_layer = total_layers - num_layers_to_train
-    
-    print(f"总层数: {total_layers}, 训练层: {start_layer}到{total_layers-1}")
-    
-    # 构建目标模块列表，只包含最后14层的模块
-    target_modules = []
-    for layer_idx in range(start_layer, total_layers):
-        # 添加该层的所有目标模块
-        layer_prefix = f"model.layers.{layer_idx}."
-        target_modules.extend([
-            f"{layer_prefix}self_attn.q_proj",
-            f"{layer_prefix}self_attn.k_proj", 
-            f"{layer_prefix}self_attn.v_proj",
-            f"{layer_prefix}self_attn.o_proj",
-            f"{layer_prefix}mlp.gate_proj",
-            f"{layer_prefix}mlp.up_proj",
-            f"{layer_prefix}mlp.down_proj"
-        ])
-    
-    return target_modules
-
-
 def main():
     parser = argparse.ArgumentParser(description='Contrastive Learning for Binary-Source Similarity')
-    parser.add_argument('--model_name', type=str, default='Qwen/Qwen2.5-Coder-3B-Instruct', choices=["Qwen/Qwen2.5-Coder-3B-Instruct", "Qwen/Qwen2.5-Coder-7B-Instruct"])
+    parser.add_argument('--model_name', type=str, default="Qwen/Qwen2.5-Coder-3B-Instruct", choices=["Qwen/Qwen2.5-Coder-3B-Instruct", 
+                                                                                                "Qwen/Qwen2.5-Coder-7B-Instruct", 
+                                                                                                "Qwen/Qwen3-Embedding-0.6B", 
+                                                                                                "jinaai/jina-code-embeddings-1.5b"])
     parser.add_argument('--train_data', type=str, default='resources/datasets/dataset_train_no_label.csv')
     parser.add_argument('--val_data', type=str, default='resources/datasets/dataset_eval_no_label.csv')
     parser.add_argument('--test_data', type=str, default='resources/datasets/dataset_test_no_label.csv')
     parser.add_argument('--output_dir', type=str, default=f'resources/finetunemodules-{datetime.now().strftime("%Y%m%d_%H%M%S")}')
-    parser.add_argument('--train_batch_size', type=int, default=8)
+    parser.add_argument('--train_batch_size', type=int, default=6)
     parser.add_argument('--eval_batch_size', type=int, default=32)
     parser.add_argument('--learning_rate', type=float, default=2e-5)
-    parser.add_argument('--num_epochs', type=int, default=20)
+    parser.add_argument('--num_epochs', type=int, default=100)
     parser.add_argument('--temperature', type=float, default=0.05)
     parser.add_argument('--max_seq_length', type=int, default=512)
     parser.add_argument('--use_wandb', action='store_true')
-    parser.add_argument('--fintune_layers', type=int, default=8)
+    parser.add_argument('--fintune_layers', type=int, default=12)
     parser.add_argument('--pooling_strategy', type=str, default='mean', choices=['last_token', 'mean', 'eos'])
     parser.add_argument('--checkpoint_dir', type=str, default=None, help='Path to load checkpoint from example: resources/finetune_modules/Epoch-3')
     
@@ -705,14 +557,13 @@ def main():
     if not checkpoint_dir:
         logger.info("!!!No checkpoint directory provided, starting training from scratch!!!")
     else:
-        args.output_dir = checkpoint_dir.split("/")[-2]
+        args.output_dir =  "resources/"+ checkpoint_dir.split("/")[-2]
     
     logger.info(f"model_name: {args.model_name}")
     logger.info(f"output_dir: {args.output_dir}")
     logger.info(f"max_seq_length: {args.max_seq_length}")
     logger.info(f"fintune_layers: {args.fintune_layers}")
     logger.info(f"pooling_strategy: {args.pooling_strategy}")
-    
     
     # 配置
     config = TrainingConfig(
@@ -731,7 +582,6 @@ def main():
         fintune_layers = args.fintune_layers,
         pooling_strategy = args.pooling_strategy
     )
-    
     
     logger.info(f"投影后的嵌入维度: {config.embedding_dim}")
     # 初始化wandb
@@ -765,7 +615,6 @@ def main():
         bnb_4bit_use_double_quant=True,  # 双重量化，额外节省 0.4 bit/参数
         bnb_4bit_compute_dtype=torch.bfloat16,  # 计算精度
     )
-    print(f"✓ 使用 4-bit 量化 (NF4 + 双重量化)")
     
     # 加载模型
     logger.info(f"Loading model")

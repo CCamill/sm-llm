@@ -9,7 +9,7 @@ from datetime import datetime
 
 
 def setup_logging(log_prefix: str = "split_func") -> logging.Logger:
-    """设置日志配置，将日志保存到resources/logs/{current_time}_{log_prefix}.log。
+    """设置日志配置，将日志保存到resources/logs/{log_prefix}-{current_time}.log。
     
     Args:
         project_root: 项目根目录路径
@@ -21,7 +21,7 @@ def setup_logging(log_prefix: str = "split_func") -> logging.Logger:
     
     # 生成日志文件名（包含当前时间）
     current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(r"resources/logs", f"{current_time}_{log_prefix}.log")
+    log_file = os.path.join(r"resources/logs", f"{log_prefix}-{current_time}.log")
     
     # 配置日志格式
     logging.basicConfig(
